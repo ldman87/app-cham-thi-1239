@@ -141,7 +141,47 @@ function normalizeIllumination(gray: Uint8Array, width: number, height: number):
       out[rowOff + x] = norm >= 255 ? 255 : norm <= 0 ? 0 : norm | 0;
     }
   }
+  // Tự động làm tối ảnh bằng đường cong Gamma khi ánh sáng mạnh / lóa đèn:
+  // Giữ nền giấy trắng sáng nhưng kéo sẫm nét bút chì 2B bị lóa sáng xuống rõ rệt.
+  let sumAll = 0;
+  for (let i = 0; i < out.length; i += 4) sumAll += out[i];
+  const avgBrightness = sumAll / (out.length / 4);
+
+  // Ảnh càng sáng (ánh sáng mạnh), gamma càng cao (1.85 .. 2.45) để làm tối nét tô rõ hơn
+  const gamma = avgBrightness > 225 ? 2.4 : avgBrightness > 200 ? 2.1 : 1.75;
+  const lut = new Uint8Array(256);
+  for (let v = 0; v < 256; v++) {
+    lut[v] = Math.min(255, Math.max(0, Math.round(255 * Math.pow(v / 255, gamma))));
+  }
+  for (let i = 0; i < out.length; i++) {
+    out[i] = lut[out[i]];
+  }
+
   return out;
+}
+
+/**
+ * Kiểm tra hình học 4 chấm đen đã bắt được có tạo thành hình chữ nhật/hình thang cân
+ * đúng tỷ lệ tờ phiếu A4 hay không (loại bỏ hoàn toàn bắt nhầm hoa văn mặt bàn).
+ */
+export function isValidCornerQuad(corners: DetectedCorners): boolean {
+  const topW = Math.hypot(corners.tr.x - corners.tl.x, corners.tr.y - corners.tl.y);
+  const botW = Math.hypot(corners.br.x - corners.bl.x, corners.br.y - corners.bl.y);
+  const leftH = Math.hypot(corners.bl.x - corners.tl.x, corners.bl.y - corners.tl.y);
+  const rightH = Math.hypot(corners.br.x - corners.tr.x, corners.br.y - corners.tr.y);
+
+  if (topW < 40 || botW < 40 || leftH < 60 || rightH < 60) return false;
+
+  // Hai cạnh đối không lệch nhau quá 20%
+  const wDiff = Math.abs(topW - botW) / Math.max(topW, botW);
+  const hDiff = Math.abs(leftH - rightH) / Math.max(leftH, rightH);
+  if (wDiff > 0.2 || hDiff > 0.2) return false;
+
+  // Tỷ lệ rộng / cao của phiếu A4 khoảng 0.69 (cho phép sai số phối cảnh 0.52 .. 0.88)
+  const avgW = (topW + botW) / 2;
+  const avgH = (leftH + rightH) / 2;
+  const aspect = avgW / avgH;
+  return aspect >= 0.52 && aspect <= 0.88;
 }
 
 function computeRegionOtsuThreshold(
@@ -333,8 +373,8 @@ export function detectLiveCornersInGuide(
   const gw = guideBox.w * w;
   const gh = guideBox.h * h;
 
-  // Vùng tìm kiếm quanh mỗi ô vuông mục tiêu ở 4 góc (~16% chiều rộng khung)
-  const boxHalf = Math.max(18, Math.round(gw * 0.13));
+  // Vùng tìm kiếm rộng tương ứng 4 ô vuông định vị lớn trên màn hình camera (~17% chiều rộng khung)
+  const boxHalf = Math.max(24, Math.round(gw * 0.17));
   const expectedRatio = (layout.fiducialSizeMm / layout.pageWidthMm) * (gw / w);
 
   const clampRegion = (cx: number, cy: number) => ({
@@ -500,8 +540,7 @@ function measureBubbleFillScore(gray: Uint8Array, layout: SheetLayout, bubble: B
   const minY = Math.max(0, Math.floor(cy - r * 1.7));
   const maxY = Math.min(H - 1, Math.ceil(cy + r * 1.7));
 
-  let innerSum = 0;
-  let innerCount = 0;
+  const innerSamples: number[] = [];
   const bgSamples: number[] = [];
 
   for (let y = minY; y <= maxY; y++) {
@@ -512,23 +551,28 @@ function measureBubbleFillScore(gray: Uint8Array, layout: SheetLayout, bubble: B
       const dx = x - cx;
       const dist2 = dx * dx + dy2;
       if (dist2 <= innerR2) {
-        innerSum += gray[rowOffset + x];
-        innerCount++;
+        innerSamples.push(gray[rowOffset + x]);
       } else if (dist2 >= bgMinR2 && dist2 <= bgMaxR2) {
         bgSamples.push(gray[rowOffset + x]);
       }
     }
   }
 
-  if (innerCount === 0) return 0;
-  const innerMean = innerSum / innerCount;
+  if (innerSamples.length === 0) return 0;
+
+  // Lấy trung bình 65% pixel tối nhất trong lõi ô tròn -> loại bỏ đốm phản quang/lóa sáng của bút chì 2B dưới đèn mạnh
+  innerSamples.sort((a, b) => a - b);
+  const takeCount = Math.max(1, Math.floor(innerSamples.length * 0.65));
+  let innerSum = 0;
+  for (let i = 0; i < takeCount; i++) innerSum += innerSamples[i];
+  const innerMean = innerSum / takeCount;
 
   let localBg = 240;
   if (bgSamples.length > 0) {
     bgSamples.sort((a, b) => a - b);
     localBg = bgSamples[Math.floor(bgSamples.length * 0.78)];
   }
-  localBg = Math.max(85, localBg);
+  localBg = Math.max(80, localBg);
 
   return Math.max(0, (localBg - innerMean) / localBg);
 }

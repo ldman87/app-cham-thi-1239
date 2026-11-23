@@ -34,6 +34,7 @@ import {
   LiveCornerStatus,
   detectLiveCornersInGuide,
   gradeBubbleReading,
+  isValidCornerQuad,
   scanOMRSheet,
 } from '../omr/omrEngine';
 import { renderSheetToCanvas } from '../omr/sheetRenderer';
@@ -90,6 +91,8 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   } | null>(null);
   const [torchOn, setTorchOn] = useState(false);
   const [torchSupported, setTorchSupported] = useState(false);
+  const [antiGlareOn, setAntiGlareOn] = useState(true); // Tự động hạ phơi sáng chống chói khi ánh sáng mạnh
+  const [exposureSupported, setExposureSupported] = useState(false);
   const [cooldownLeftMs, setCooldownLeftMs] = useState(0);
 
   // Thẻ nổi hiển thị nhanh kết quả (1s..5s)
@@ -113,8 +116,9 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isCapturingRef = useRef(false);
   const stableLockCountRef = useRef(0);
+  const prevCornersRef = useRef<DetectedCorners | null>(null);
   const cooldownUntilRef = useRef(0);
-  const lastActivityTimeRef = useRef(0);
+  const partialSightStartRef = useRef<number | null>(null);
 
   const showCameraBanner = (type: 'error' | 'warning' | 'success', text: string, ms = 3200) => {
     if (cameraBannerTimerRef.current) window.clearTimeout(cameraBannerTimerRef.current);
@@ -235,10 +239,11 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   };
 
   /**
-   * Vòng lặp quét thời gian thực (Real-time 4-Corner Auto Lock & Auto Grade):
-   * - Kiểm tra 4 ô vuông mỗi 160ms trên ảnh nhỏ (~480px) để đổi màu xanh từng góc tức thì.
-   * - Khi 4/4 góc đều xanh liên tiếp 2 khung hình -> tự động chụp độ phân giải full & chấm ngay.
-   * - Nếu quá thời gian không bắt đủ 4 góc -> hiện cảnh báo trên màn hình Camera rồi tự ẩn.
+   * Vòng lặp quét thời gian thực (Real-time 4-Corner Strict Auto Lock & Auto Grade):
+   * - Kiểm tra 4 ô vuông mỗi 160ms trên ảnh thu nhỏ (~520px).
+   * - CHỈ chấm khi bắt ĐỦ 4/4 chấm đen + đúng tỷ lệ hình học phiếu A4 + giữ ổn định 3 khung hình liên tiếp.
+   * - Nếu chưa đưa camera vào phiếu (0/4 góc) -> TUYỆT ĐỐI không bật thông báo lỗi.
+   * - Chỉ nhắc nhẹ nếu đang thấy 1–3 chấm đen kéo dài quá 7 giây mà vẫn thiếu góc.
    */
   useEffect(() => {
     if (!cameraOpen || !exam || dupPrompt) return;
@@ -246,10 +251,11 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
     const layout = getLayoutForExam(exam.templateType || 'bgd1239', exam.customSheet);
     const probeCanvas = document.createElement('canvas');
     const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true })!;
-    lastActivityTimeRef.current = Date.now();
+    partialSightStartRef.current = null;
     stableLockCountRef.current = 0;
+    prevCornersRef.current = null;
 
-    const timeoutMs = Math.max(6000, Math.round(scanSettings.scanSpeedSeconds * 4000));
+    const partialTimeoutMs = Math.max(7000, Math.round(scanSettings.scanSpeedSeconds * 4500));
 
     const timer = window.setInterval(async () => {
       const video = videoRef.current;
@@ -260,7 +266,6 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       setCooldownLeftMs(remain);
       if (remain > 0 || isCapturingRef.current) return;
 
-      // Vẽ khung hình thu nhỏ để dò 4 chấm đen cực nhanh
       const probeMax = 520;
       const pScale = Math.min(1, probeMax / Math.max(video.videoWidth, video.videoHeight));
       probeCanvas.width = Math.round(video.videoWidth * pScale);
@@ -270,33 +275,58 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       const guideNorm = computeGuideBoxOnVideo();
       const probeData = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height);
       const status = detectLiveCornersInGuide(probeData, guideNorm, layout);
+
+      // Kiểm tra chặt chẽ: đủ 4/4 góc VÀ đúng tỷ lệ hình học phiếu A4
+      const candidateQuad: DetectedCorners | null =
+        status.foundCount === 4 && status.tl && status.tr && status.br && status.bl
+          ? { tl: status.tl, tr: status.tr, br: status.br, bl: status.bl }
+          : null;
+
+      const isQuadValid = candidateQuad ? isValidCornerQuad(candidateQuad) : false;
       setLiveCorners(status);
 
-      if (status.foundCount === 4 && status.tl && status.tr && status.br && status.bl) {
-        stableLockCountRef.current++;
-        lastActivityTimeRef.current = now;
+      if (candidateQuad && isQuadValid) {
+        partialSightStartRef.current = null;
 
-        // Giữ ổn định 2 khung hình liên tiếp (~300ms) -> tự động chụp full-res và chấm!
-        if (stableLockCountRef.current >= 2) {
+        // Kiểm tra ổn định tọa độ giữa các khung hình (chống rung tay)
+        const prev = prevCornersRef.current;
+        const isStable =
+          prev &&
+          Math.hypot(candidateQuad.tl.x - prev.tl.x, candidateQuad.tl.y - prev.tl.y) < 14 &&
+          Math.hypot(candidateQuad.tr.x - prev.tr.x, candidateQuad.tr.y - prev.tr.y) < 14 &&
+          Math.hypot(candidateQuad.br.x - prev.br.x, candidateQuad.br.y - prev.br.y) < 14 &&
+          Math.hypot(candidateQuad.bl.x - prev.bl.x, candidateQuad.bl.y - prev.bl.y) < 14;
+
+        prevCornersRef.current = candidateQuad;
+        stableLockCountRef.current = isStable ? stableLockCountRef.current + 1 : 1;
+
+        // Giữ ổn định 3 khung hình liên tiếp (~450ms) -> mới tự động chụp full-res & chấm!
+        if (stableLockCountRef.current >= 3) {
           stableLockCountRef.current = 0;
+          prevCornersRef.current = null;
           const fullCorners: DetectedCorners = {
-            tl: { x: status.tl.x / pScale, y: status.tl.y / pScale },
-            tr: { x: status.tr.x / pScale, y: status.tr.y / pScale },
-            br: { x: status.br.x / pScale, y: status.br.y / pScale },
-            bl: { x: status.bl.x / pScale, y: status.bl.y / pScale },
+            tl: { x: candidateQuad.tl.x / pScale, y: candidateQuad.tl.y / pScale },
+            tr: { x: candidateQuad.tr.x / pScale, y: candidateQuad.tr.y / pScale },
+            br: { x: candidateQuad.br.x / pScale, y: candidateQuad.br.y / pScale },
+            bl: { x: candidateQuad.bl.x / pScale, y: candidateQuad.bl.y / pScale },
           };
           await handleAutoCaptureLockedCorners(fullCorners);
         }
       } else {
         stableLockCountRef.current = 0;
-        // Quá thời gian quét mà chưa bắt đủ 4 chấm đen -> hiện thông báo trên màn hình Camera
-        if (now - lastActivityTimeRef.current >= timeoutMs) {
-          lastActivityTimeRef.current = now;
-          showCameraBanner(
-            'warning',
-            `${t.camTimeoutMsg} (${status.foundCount}/4)`,
-            3200
-          );
+        prevCornersRef.current = null;
+
+        if (status.foundCount === 0) {
+          // Chưa đưa camera tới phiếu -> KHÔNG đếm lỗi, KHÔNG báo lỗi!
+          partialSightStartRef.current = null;
+        } else {
+          // Đã thấy 1..3 chấm đen -> bắt đầu đếm nếu giữ quá lâu vẫn thiếu góc
+          if (partialSightStartRef.current === null) {
+            partialSightStartRef.current = now;
+          } else if (now - partialSightStartRef.current >= partialTimeoutMs) {
+            partialSightStartRef.current = now;
+            showCameraBanner('warning', `${t.camTimeoutMsg} (${status.foundCount}/4)`, 3000);
+          }
         }
       }
     }, 160);
@@ -306,6 +336,29 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraOpen, exam?.id, dupPrompt, scanSettings.scanSpeedSeconds, t]);
+
+  const applyCameraExposure = async (track: MediaStreamTrack, darken: boolean) => {
+    try {
+      const caps = track.getCapabilities?.() as
+        | { exposureCompensation?: { min: number; max: number; step?: number } }
+        | undefined;
+      if (!caps?.exposureCompensation) return;
+      const { min, max } = caps.exposureCompensation;
+      const target = darken ? Math.max(min, -1.0) : Math.min(max, Math.max(min, 0));
+      await track.applyConstraints({
+        advanced: [{ exposureCompensation: target } as MediaTrackConstraintSet],
+      });
+    } catch {
+      // ignore if browser/device doesn't support exposureCompensation
+    }
+  };
+
+  const toggleAntiGlare = async () => {
+    const next = !antiGlareOn;
+    setAntiGlareOn(next);
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (track) await applyCameraExposure(track, next);
+  };
 
   const toggleTorch = async () => {
     if (!streamRef.current) return;
@@ -336,10 +389,14 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       });
       streamRef.current = stream;
 
-      // Kiểm tra hỗ trợ đèn Flash (Torch)
       const track = stream.getVideoTracks()[0];
       const caps = track?.getCapabilities?.() as Record<string, unknown> | undefined;
       setTorchSupported(Boolean(caps && 'torch' in caps));
+      const hasExp = Boolean(caps && 'exposureCompensation' in caps);
+      setExposureSupported(hasExp);
+      if (hasExp && antiGlareOn) {
+        applyCameraExposure(track, true);
+      }
 
       setCameraOpen(true);
       setTimeout(() => {
@@ -422,7 +479,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
 
       // Đặt thời gian nghỉ giữa 2 lần chấm theo tốc độ người dùng đã chọn
       cooldownUntilRef.current = Date.now() + Math.max(800, Math.round(scanSettings.scanSpeedSeconds * 1000));
-      lastActivityTimeRef.current = Date.now();
+      partialSightStartRef.current = null;
 
       // Cảnh báo nổi ngay trên màn hình camera nếu không thấy Mã đề trong kỳ thi đang chấm
       if (graded.warning) {
@@ -440,7 +497,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
     } catch (err) {
       playBeep(360, 180);
       cooldownUntilRef.current = Date.now() + 1200;
-      lastActivityTimeRef.current = Date.now();
+      partialSightStartRef.current = null;
       showCameraBanner(
         'error',
         err instanceof Error ? err.message : 'Lỗi nhận diện phiếu.',
@@ -1088,6 +1145,17 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
               <div className="text-[11px] text-slate-300 mt-0.5">{t.swipeToBack}</div>
             </div>
             <div className="flex items-center gap-2">
+              {exposureSupported && (
+                <button
+                  onClick={toggleAntiGlare}
+                  className={`px-2.5 py-1.5 rounded-full text-[11px] font-bold transition ${
+                    antiGlareOn ? 'bg-blue-500 text-white' : 'bg-white/15 text-slate-200'
+                  }`}
+                  title="Tự động hạ sáng chống chói"
+                >
+                  {antiGlareOn ? 'EV-' : 'EV 0'}
+                </button>
+              )}
               {torchSupported && (
                 <button
                   onClick={toggleTorch}
@@ -1133,32 +1201,32 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
           <div className="relative flex-1 overflow-hidden flex items-center justify-center">
             <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
 
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-5">
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-8">
               <div
                 ref={guideBoxRef}
-                className={`w-full max-w-[360px] max-h-[76vh] aspect-[196/283] border-2 border-dashed rounded-md relative transition-colors duration-150 ${
-                  liveCorners.foundCount === 4 ? 'border-emerald-400' : 'border-white/50'
+                className={`w-full max-w-[340px] max-h-[72vh] aspect-[196/283] border-2 border-dashed rounded-md relative transition-colors duration-150 ${
+                  liveCorners.foundCount === 4 ? 'border-[#00e038]' : 'border-white/50'
                 }`}
               >
-                {/* 4 ô vuông mục tiêu ở 4 góc — đổi màu XANH LÁ ngay khi chấm đen lọt vào */}
+                {/* 4 ô vuông định vị lớn (64x64px) ở 4 góc — đổi màu XANH LÁ ngay khi chấm đen lọt vào */}
                 {(
                   [
-                    { key: 'tl', found: Boolean(liveCorners.tl), pos: '-top-5 -left-5' },
-                    { key: 'tr', found: Boolean(liveCorners.tr), pos: '-top-5 -right-5' },
-                    { key: 'bl', found: Boolean(liveCorners.bl), pos: '-bottom-5 -left-5' },
-                    { key: 'br', found: Boolean(liveCorners.br), pos: '-bottom-5 -right-5' },
+                    { key: 'tl', found: Boolean(liveCorners.tl), pos: '-top-8 -left-8' },
+                    { key: 'tr', found: Boolean(liveCorners.tr), pos: '-top-8 -right-8' },
+                    { key: 'bl', found: Boolean(liveCorners.bl), pos: '-bottom-8 -left-8' },
+                    { key: 'br', found: Boolean(liveCorners.br), pos: '-bottom-8 -right-8' },
                   ] as const
                 ).map((box) => (
                   <div
                     key={box.key}
-                    className={`w-10 h-10 rounded-md border-[3.5px] absolute ${box.pos} flex items-center justify-center transition-all duration-150 ${
+                    className={`w-16 h-16 rounded-xl border-4 absolute ${box.pos} flex items-center justify-center transition-all duration-150 ${
                       box.found
-                        ? 'border-[#00e038] bg-[#00e038]/30 scale-110 shadow-[0_0_14px_rgba(0,224,56,0.9)]'
+                        ? 'border-[#00e038] bg-[#00e038]/25 scale-105 shadow-[0_0_18px_rgba(0,224,56,0.95)]'
                         : 'border-white/95 bg-black/25'
                     }`}
                   >
                     <div
-                      className={`w-2 h-2 rounded-sm ${
+                      className={`w-3 h-3 rounded-sm ${
                         box.found ? 'bg-[#00e038]' : 'bg-white/75'
                       }`}
                     />
