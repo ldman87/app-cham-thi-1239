@@ -43,13 +43,105 @@ export interface OMRScanResult {
   layout: SheetLayout;
 }
 
+export interface LiveCornerStatus {
+  tl: Point2D | null;
+  tr: Point2D | null;
+  br: Point2D | null;
+  bl: Point2D | null;
+  foundCount: number;
+}
+
+export interface GuideBoxNorm {
+  x: number; // 0..1
+  y: number; // 0..1
+  w: number; // 0..1
+  h: number; // 0..1
+}
+
+/**
+ * Chuyển ImageData sang ảnh xám tối ưu cho nhận diện mực/bút chì (Ink-enhanced grayscale).
+ * Kết hợp độ sáng chuẩn với kênh màu tối nhất min(R,G,B) giúp bắt cực rõ cả bút chì 2B,
+ * bút bi đen lẫn bút bi xanh dương trong mọi điều kiện ánh sáng.
+ */
 function toGrayscale(imageData: ImageData): Uint8Array {
   const { data, width, height } = imageData;
   const gray = new Uint8Array(width * height);
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-    gray[p] = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const luma = (r * 77 + g * 150 + b * 29) >> 8;
+    const minC = r < g ? (r < b ? r : b) : g < b ? g : b;
+    gray[p] = (luma * 45 + minC * 55) / 100;
   }
   return gray;
+}
+
+/**
+ * Cân bằng ánh sáng cục bộ (Illumination Normalization / Flat-Field Correction).
+ * Triệt tiêu bóng tay, góc tối, ánh đèn chói không đều trên tờ phiếu bằng cách chia
+ * từng pixel cho độ sáng nền giấy cục bộ ước lượng theo lưới ô.
+ */
+function normalizeIllumination(gray: Uint8Array, width: number, height: number): Uint8Array {
+  const cols = 28;
+  const rows = 40;
+  const cellW = width / cols;
+  const cellH = height / rows;
+  const bgGrid = new Float32Array(cols * rows);
+
+  // Ước lượng độ sáng nền giấy (phân vị 85%) ở từng ô lưới
+  for (let gy = 0; gy < rows; gy++) {
+    const y0 = Math.floor(gy * cellH);
+    const y1 = Math.min(height, Math.floor((gy + 1) * cellH));
+    for (let gx = 0; gx < cols; gx++) {
+      const x0 = Math.floor(gx * cellW);
+      const x1 = Math.min(width, Math.floor((gx + 1) * cellW));
+      const samples: number[] = [];
+      for (let y = y0; y < y1; y += 3) {
+        const rowOff = y * width;
+        for (let x = x0; x < x1; x += 3) {
+          samples.push(gray[rowOff + x]);
+        }
+      }
+      if (samples.length === 0) {
+        bgGrid[gy * cols + gx] = 240;
+      } else {
+        samples.sort((a, b) => a - b);
+        bgGrid[gy * cols + gx] = Math.max(65, samples[Math.floor(samples.length * 0.85)]);
+      }
+    }
+  }
+
+  // Chuẩn hóa từng pixel theo nền nội suy song tuyến tính
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const fy = (y + 0.5) / cellH - 0.5;
+    const gy0 = Math.max(0, Math.min(rows - 1, Math.floor(fy)));
+    const gy1 = Math.min(rows - 1, gy0 + 1);
+    const ty = Math.max(0, Math.min(1, fy - gy0));
+    const rowOff = y * width;
+
+    for (let x = 0; x < width; x++) {
+      const fx = (x + 0.5) / cellW - 0.5;
+      const gx0 = Math.max(0, Math.min(cols - 1, Math.floor(fx)));
+      const gx1 = Math.min(cols - 1, gx0 + 1);
+      const tx = Math.max(0, Math.min(1, fx - gx0));
+
+      const b00 = bgGrid[gy0 * cols + gx0];
+      const b10 = bgGrid[gy0 * cols + gx1];
+      const b01 = bgGrid[gy1 * cols + gx0];
+      const b11 = bgGrid[gy1 * cols + gx1];
+      const localBg =
+        b00 * (1 - tx) * (1 - ty) +
+        b10 * tx * (1 - ty) +
+        b01 * (1 - tx) * ty +
+        b11 * tx * ty;
+
+      const norm = (gray[rowOff + x] * 245) / localBg;
+      out[rowOff + x] = norm >= 255 ? 255 : norm <= 0 ? 0 : norm | 0;
+    }
+  }
+  return out;
 }
 
 function computeRegionOtsuThreshold(
@@ -222,6 +314,49 @@ export function detectFiducials(imageData: ImageData, layout: SheetLayout): Dete
 
   if (!tl || !tr || !br || !bl) return null;
   return { tl, tr, br, bl };
+}
+
+/**
+ * Kiểm tra thời gian thực 4 chấm đen có nằm lọt trong 4 ô vuông định vị trên màn hình Camera không.
+ * Chạy siêu nhanh (~15-30ms trên ảnh nhỏ) để đổi màu xanh từng góc ngay lập tức.
+ */
+export function detectLiveCornersInGuide(
+  imageData: ImageData,
+  guideBox: GuideBoxNorm,
+  layout: SheetLayout
+): LiveCornerStatus {
+  const { width: w, height: h } = imageData;
+  const gray = toGrayscale(imageData);
+
+  const gx0 = guideBox.x * w;
+  const gy0 = guideBox.y * h;
+  const gw = guideBox.w * w;
+  const gh = guideBox.h * h;
+
+  // Vùng tìm kiếm quanh mỗi ô vuông mục tiêu ở 4 góc (~16% chiều rộng khung)
+  const boxHalf = Math.max(18, Math.round(gw * 0.13));
+  const expectedRatio = (layout.fiducialSizeMm / layout.pageWidthMm) * (gw / w);
+
+  const clampRegion = (cx: number, cy: number) => ({
+    x0: Math.max(0, Math.floor(cx - boxHalf)),
+    y0: Math.max(0, Math.floor(cy - boxHalf)),
+    x1: Math.min(w, Math.ceil(cx + boxHalf)),
+    y1: Math.min(h, Math.ceil(cy + boxHalf)),
+    target: { x: cx, y: cy },
+  });
+
+  const rTL = clampRegion(gx0, gy0);
+  const rTR = clampRegion(gx0 + gw, gy0);
+  const rBL = clampRegion(gx0, gy0 + gh);
+  const rBR = clampRegion(gx0 + gw, gy0 + gh);
+
+  const tl = findFiducialInRegion(gray, w, rTL.x0, rTL.y0, rTL.x1, rTL.y1, rTL.target, expectedRatio);
+  const tr = findFiducialInRegion(gray, w, rTR.x0, rTR.y0, rTR.x1, rTR.y1, rTR.target, expectedRatio);
+  const bl = findFiducialInRegion(gray, w, rBL.x0, rBL.y0, rBL.x1, rBL.y1, rBL.target, expectedRatio);
+  const br = findFiducialInRegion(gray, w, rBR.x0, rBR.y0, rBR.x1, rBR.y1, rBR.target, expectedRatio);
+
+  const foundCount = (tl ? 1 : 0) + (tr ? 1 : 0) + (br ? 1 : 0) + (bl ? 1 : 0);
+  return { tl, tr, br, bl, foundCount };
 }
 
 function solveLinearSystem8(A: number[][], b: number[]): number[] {
@@ -456,7 +591,8 @@ function pickSingleFilledIndex(
 
 export function scanOMRSheet(
   source: HTMLImageElement | HTMLCanvasElement,
-  exam: Exam
+  exam: Exam,
+  preDetectedCorners?: DetectedCorners
 ): OMRScanResult {
   const layout = getLayoutForExam(exam.templateType || 'bgd1239', exam.customSheet);
 
@@ -472,7 +608,15 @@ export function scanOMRSheet(
   workCtx.drawImage(source, 0, 0, workCanvas.width, workCanvas.height);
 
   const srcImageData = workCtx.getImageData(0, 0, workCanvas.width, workCanvas.height);
-  const corners = detectFiducials(srcImageData, layout);
+  const corners = preDetectedCorners
+    ? {
+        tl: { x: preDetectedCorners.tl.x * scale, y: preDetectedCorners.tl.y * scale },
+        tr: { x: preDetectedCorners.tr.x * scale, y: preDetectedCorners.tr.y * scale },
+        br: { x: preDetectedCorners.br.x * scale, y: preDetectedCorners.br.y * scale },
+        bl: { x: preDetectedCorners.bl.x * scale, y: preDetectedCorners.bl.y * scale },
+      }
+    : detectFiducials(srcImageData, layout);
+
   if (!corners) {
     throw new Error(
       'Không tìm thấy đủ 4 ô vuông đen định vị ở 4 góc phiếu. Hãy chụp rõ toàn bộ tờ phiếu trên nền tương phản và đủ ánh sáng.'
@@ -482,7 +626,9 @@ export function scanOMRSheet(
   const warpedCanvas = warpPerspective(srcImageData, corners, layout);
   const warpedCtx = warpedCanvas.getContext('2d')!;
   const warpedData = warpedCtx.getImageData(0, 0, layout.warpedWidth, layout.warpedHeight);
-  const gray = toGrayscale(warpedData);
+  // Cân bằng ánh sáng cục bộ triệt tiêu bóng đổ trước khi đọc ô tô
+  const rawGray = toGrayscale(warpedData);
+  const gray = normalizeIllumination(rawGray, layout.warpedWidth, layout.warpedHeight);
 
   const sbd = layout.sbdBubbles
     .map((col) => {

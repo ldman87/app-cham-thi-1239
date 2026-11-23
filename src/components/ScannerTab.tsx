@@ -13,6 +13,8 @@ import {
   Trash2,
   UploadCloud,
   X,
+  Zap,
+  ZapOff,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
@@ -26,8 +28,16 @@ import {
   Student,
 } from '../types';
 import { TDict } from '../i18n/translations';
-import { gradeBubbleReading, scanOMRSheet } from '../omr/omrEngine';
+import {
+  DetectedCorners,
+  GuideBoxNorm,
+  LiveCornerStatus,
+  detectLiveCornersInGuide,
+  gradeBubbleReading,
+  scanOMRSheet,
+} from '../omr/omrEngine';
 import { renderSheetToCanvas } from '../omr/sheetRenderer';
+import { getLayoutForExam } from '../omr/sheetTemplate';
 
 interface ScannerTabProps {
   t: TDict;
@@ -66,9 +76,26 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
+  // Trạng thái 4 ô vuông định vị thời gian thực trên Camera
+  const [liveCorners, setLiveCorners] = useState<LiveCornerStatus>({
+    tl: null,
+    tr: null,
+    br: null,
+    bl: null,
+    foundCount: 0,
+  });
+  const [cameraBanner, setCameraBanner] = useState<{
+    type: 'error' | 'warning' | 'success';
+    text: string;
+  } | null>(null);
+  const [torchOn, setTorchOn] = useState(false);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [cooldownLeftMs, setCooldownLeftMs] = useState(0);
+
   // Thẻ nổi hiển thị nhanh kết quả (1s..5s)
   const [flashPaper, setFlashPaper] = useState<GradedPaper | null>(null);
   const flashTimerRef = useRef<number | null>(null);
+  const cameraBannerTimerRef = useRef<number | null>(null);
 
   // Xử lý trùng SBD khi chấm lại
   const [dupPrompt, setDupPrompt] = useState<DuplicatePrompt | null>(null);
@@ -81,10 +108,44 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const [editEssay, setEditEssay] = useState('0');
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const guideBoxRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const autoScanTimerRef = useRef<number | null>(null);
   const isCapturingRef = useRef(false);
+  const stableLockCountRef = useRef(0);
+  const cooldownUntilRef = useRef(0);
+  const lastActivityTimeRef = useRef(0);
+
+  const showCameraBanner = (type: 'error' | 'warning' | 'success', text: string, ms = 3200) => {
+    if (cameraBannerTimerRef.current) window.clearTimeout(cameraBannerTimerRef.current);
+    setCameraBanner({ type, text });
+    cameraBannerTimerRef.current = window.setTimeout(() => {
+      setCameraBanner(null);
+    }, ms);
+  };
+
+  /** Phát âm thanh bíp nhẹ khi chấm xong hoặc cảnh báo */
+  const playBeep = (freq = 880, durationMs = 95) => {
+    try {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.value = 0.14;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      setTimeout(() => {
+        osc.stop();
+        ctx.close().catch(() => {});
+      }, durationMs);
+    } catch {
+      // ignore audio error
+    }
+  };
 
   // Theo dõi cử chỉ vuốt từ trái sang phải để quay lại
   const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -117,50 +178,153 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   };
 
   const stopCamera = () => {
-    if (autoScanTimerRef.current) {
-      window.clearInterval(autoScanTimerRef.current);
-      autoScanTimerRef.current = null;
-    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    setTorchOn(false);
+    setTorchSupported(false);
     setCameraOpen(false);
+    setCameraBanner(null);
+    setLiveCorners({ tl: null, tr: null, br: null, bl: null, foundCount: 0 });
   };
 
   useEffect(() => {
     return () => {
-      if (autoScanTimerRef.current) window.clearInterval(autoScanTimerRef.current);
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+      if (cameraBannerTimerRef.current) window.clearTimeout(cameraBannerTimerRef.current);
     };
   }, []);
 
-  // Tự động quét liên tục khi bật autoScanCamera
+  /** Quy đổi tọa độ khung ngắm 4 ô vuông trên màn hình sang tọa độ chuẩn hóa [0..1] của khung hình video gốc (có tính object-cover) */
+  const computeGuideBoxOnVideo = (): GuideBoxNorm => {
+    const video = videoRef.current;
+    const guide = guideBoxRef.current;
+    if (!video || !guide || !video.videoWidth || !video.videoHeight) {
+      return { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+    }
+    const vRect = video.getBoundingClientRect();
+    const gRect = guide.getBoundingClientRect();
+
+    const vidRatio = video.videoWidth / video.videoHeight;
+    const elRatio = vRect.width / vRect.height;
+
+    let renderedW = vRect.width;
+    let renderedH = vRect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (vidRatio > elRatio) {
+      // Video rộng hơn phần tử -> bị cắt 2 bên trái/phải
+      renderedH = vRect.height;
+      renderedW = vRect.height * vidRatio;
+      offsetX = (renderedW - vRect.width) / 2;
+    } else {
+      // Video cao hơn phần tử -> bị cắt trên/dưới
+      renderedW = vRect.width;
+      renderedH = vRect.width / vidRatio;
+      offsetY = (renderedH - vRect.height) / 2;
+    }
+
+    const x = Math.max(0, Math.min(1, (gRect.left - vRect.left + offsetX) / renderedW));
+    const y = Math.max(0, Math.min(1, (gRect.top - vRect.top + offsetY) / renderedH));
+    const w = Math.max(0.1, Math.min(1 - x, gRect.width / renderedW));
+    const h = Math.max(0.1, Math.min(1 - y, gRect.height / renderedH));
+    return { x, y, w, h };
+  };
+
+  /**
+   * Vòng lặp quét thời gian thực (Real-time 4-Corner Auto Lock & Auto Grade):
+   * - Kiểm tra 4 ô vuông mỗi 160ms trên ảnh nhỏ (~480px) để đổi màu xanh từng góc tức thì.
+   * - Khi 4/4 góc đều xanh liên tiếp 2 khung hình -> tự động chụp độ phân giải full & chấm ngay.
+   * - Nếu quá thời gian không bắt đủ 4 góc -> hiện cảnh báo trên màn hình Camera rồi tự ẩn.
+   */
   useEffect(() => {
-    if (autoScanTimerRef.current) {
-      window.clearInterval(autoScanTimerRef.current);
-      autoScanTimerRef.current = null;
-    }
-    if (cameraOpen && scanSettings.autoScanCamera && !dupPrompt) {
-      const intervalMs = Math.max(500, Math.round(scanSettings.scanSpeedSeconds * 1000));
-      autoScanTimerRef.current = window.setInterval(() => {
-        if (!isCapturingRef.current) {
-          handleCaptureFromCamera(true);
+    if (!cameraOpen || !exam || dupPrompt) return;
+
+    const layout = getLayoutForExam(exam.templateType || 'bgd1239', exam.customSheet);
+    const probeCanvas = document.createElement('canvas');
+    const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true })!;
+    lastActivityTimeRef.current = Date.now();
+    stableLockCountRef.current = 0;
+
+    const timeoutMs = Math.max(6000, Math.round(scanSettings.scanSpeedSeconds * 4000));
+
+    const timer = window.setInterval(async () => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+
+      const now = Date.now();
+      const remain = Math.max(0, cooldownUntilRef.current - now);
+      setCooldownLeftMs(remain);
+      if (remain > 0 || isCapturingRef.current) return;
+
+      // Vẽ khung hình thu nhỏ để dò 4 chấm đen cực nhanh
+      const probeMax = 520;
+      const pScale = Math.min(1, probeMax / Math.max(video.videoWidth, video.videoHeight));
+      probeCanvas.width = Math.round(video.videoWidth * pScale);
+      probeCanvas.height = Math.round(video.videoHeight * pScale);
+      probeCtx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height);
+
+      const guideNorm = computeGuideBoxOnVideo();
+      const probeData = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height);
+      const status = detectLiveCornersInGuide(probeData, guideNorm, layout);
+      setLiveCorners(status);
+
+      if (status.foundCount === 4 && status.tl && status.tr && status.br && status.bl) {
+        stableLockCountRef.current++;
+        lastActivityTimeRef.current = now;
+
+        // Giữ ổn định 2 khung hình liên tiếp (~300ms) -> tự động chụp full-res và chấm!
+        if (stableLockCountRef.current >= 2) {
+          stableLockCountRef.current = 0;
+          const fullCorners: DetectedCorners = {
+            tl: { x: status.tl.x / pScale, y: status.tl.y / pScale },
+            tr: { x: status.tr.x / pScale, y: status.tr.y / pScale },
+            br: { x: status.br.x / pScale, y: status.br.y / pScale },
+            bl: { x: status.bl.x / pScale, y: status.bl.y / pScale },
+          };
+          await handleAutoCaptureLockedCorners(fullCorners);
         }
-      }, intervalMs);
-    }
-    return () => {
-      if (autoScanTimerRef.current) {
-        window.clearInterval(autoScanTimerRef.current);
-        autoScanTimerRef.current = null;
+      } else {
+        stableLockCountRef.current = 0;
+        // Quá thời gian quét mà chưa bắt đủ 4 chấm đen -> hiện thông báo trên màn hình Camera
+        if (now - lastActivityTimeRef.current >= timeoutMs) {
+          lastActivityTimeRef.current = now;
+          showCameraBanner(
+            'warning',
+            `${t.camTimeoutMsg} (${status.foundCount}/4)`,
+            3200
+          );
+        }
       }
+    }, 160);
+
+    return () => {
+      window.clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraOpen, scanSettings.autoScanCamera, scanSettings.scanSpeedSeconds, dupPrompt, exam?.id]);
+  }, [cameraOpen, exam?.id, dupPrompt, scanSettings.scanSpeedSeconds, t]);
+
+  const toggleTorch = async () => {
+    if (!streamRef.current) return;
+    const track = streamRef.current.getVideoTracks()[0];
+    if (!track) return;
+    try {
+      const next = !torchOn;
+      await track.applyConstraints({
+        advanced: [{ torch: next } as MediaTrackConstraintSet],
+      });
+      setTorchOn(next);
+    } catch {
+      showCameraBanner('warning', 'Thiết bị không hỗ trợ bật đèn Flash trên trình duyệt.', 2500);
+    }
+  };
 
   const startCamera = async () => {
     setCameraError(null);
+    setCameraBanner(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -171,6 +335,12 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
         audio: false,
       });
       streamRef.current = stream;
+
+      // Kiểm tra hỗ trợ đèn Flash (Torch)
+      const track = stream.getVideoTracks()[0];
+      const caps = track?.getCapabilities?.() as Record<string, unknown> | undefined;
+      setTorchSupported(Boolean(caps && 'torch' in caps));
+
       setCameraOpen(true);
       setTimeout(() => {
         if (videoRef.current) {
@@ -180,7 +350,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       }, 100);
     } catch {
       setCameraError(
-        'Không thể mở camera trực tiếp (cần HTTPS khi mở qua mạng LAN trên điện thoại, hoặc chưa cấp quyền camera). Thầy vẫn có thể dùng nút "Chọn ảnh / Chụp" hoặc kéo thả ảnh chụp từ điện thoại vào bên dưới!'
+        'Không thể mở camera trực tiếp (cần HTTPS hoặc chưa cấp quyền camera). Thầy vẫn có thể dùng nút "Chọn ảnh / Chụp" hoặc kéo thả ảnh vào bên dưới!'
       );
     }
   };
@@ -233,13 +403,12 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
     }
   };
 
-  const handleCaptureFromCamera = async (silentOnMiss = false) => {
+  const handleAutoCaptureLockedCorners = async (fullCorners: DetectedCorners) => {
     if (!videoRef.current || !exam || isCapturingRef.current) return;
     if (videoRef.current.videoWidth === 0) return;
 
     isCapturingRef.current = true;
-    if (!silentOnMiss) setProcessing(true);
-    setStatusMsg(null);
+    setProcessing(true);
     try {
       const video = videoRef.current;
       const canvas = document.createElement('canvas');
@@ -248,16 +417,38 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(video, 0, 0);
 
-      const scanResult = scanOMRSheet(canvas, exam);
+      const scanResult = scanOMRSheet(canvas, exam, fullCorners);
       const graded = gradeBubbleReading(scanResult.reading, exam, students, scanResult.warpedCanvas);
+
+      // Đặt thời gian nghỉ giữa 2 lần chấm theo tốc độ người dùng đã chọn
+      cooldownUntilRef.current = Date.now() + Math.max(800, Math.round(scanSettings.scanSpeedSeconds * 1000));
+      lastActivityTimeRef.current = Date.now();
+
+      // Cảnh báo nổi ngay trên màn hình camera nếu không thấy Mã đề trong kỳ thi đang chấm
+      if (graded.warning) {
+        playBeep(420, 180);
+        showCameraBanner(
+          'warning',
+          `${t.camMissingCodeMsg}: "${graded.examCode}"`,
+          3500
+        );
+      } else {
+        playBeep(920, 95);
+      }
+
       await saveWithDuplicateCheck(graded, true, false);
     } catch (err) {
-      if (!silentOnMiss) {
-        setStatusMsg(err instanceof Error ? err.message : 'Lỗi nhận diện phiếu.');
-      }
+      playBeep(360, 180);
+      cooldownUntilRef.current = Date.now() + 1200;
+      lastActivityTimeRef.current = Date.now();
+      showCameraBanner(
+        'error',
+        err instanceof Error ? err.message : 'Lỗi nhận diện phiếu.',
+        3200
+      );
     } finally {
       isCapturingRef.current = false;
-      if (!silentOnMiss) setProcessing(false);
+      setProcessing(false);
     }
   };
 
@@ -870,55 +1061,127 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
         </div>
       )}
 
-      {/* OVERLAY CAMERA CHẤM LIÊN TỤC (HỖ TRỢ VUỐT TỪ TRÁI SANG PHẢI ĐỂ QUAY LẠI) */}
+      {/* OVERLAY CAMERA TỰ ĐỘNG BẮT 4 CHẤM ĐEN (KHÔNG CẦN NÚT CHỤP THỦ CÔNG + VUỐT ĐỂ QUAY LẠI) */}
       {cameraOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black flex flex-col touch-pan-y"
+          className="fixed inset-0 z-50 bg-black flex flex-col touch-pan-y select-none"
           onTouchStart={handleTouchStart}
           onTouchEnd={handleTouchEndBack(stopCamera)}
         >
-          <div className="flex items-center justify-between px-4 py-3 text-white bg-black/75">
+          {/* Thanh trên Camera */}
+          <div className="flex items-center justify-between px-4 py-3 text-white bg-black/75 z-10">
             <div className="text-xs">
-              <div className="font-bold">
-                {t.btnScanCamera} ({papers.length} {t.papersUnit}){' '}
-                {scanSettings.autoScanCamera && (
-                  <span className="ml-1.5 text-[10px] bg-emerald-500 text-white px-2 py-0.5 rounded-full">
-                    AUTO {scanSettings.scanSpeedSeconds}s
-                  </span>
-                )}
+              <div className="font-bold flex items-center gap-2">
+                <span>
+                  {t.btnScanCamera} ({papers.length} {t.papersUnit})
+                </span>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                    liveCorners.foundCount === 4
+                      ? 'bg-emerald-500 text-white'
+                      : 'bg-white/20 text-slate-200'
+                  }`}
+                >
+                  {t.cornersLocked}: {liveCorners.foundCount}/4 {t.cornersUnit}
+                </span>
               </div>
-              <div className="text-[11px] text-slate-300">{t.swipeToBack}</div>
+              <div className="text-[11px] text-slate-300 mt-0.5">{t.swipeToBack}</div>
             </div>
-            <button onClick={stopCamera} className="p-2 bg-white/15 rounded-full">
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2">
+              {torchSupported && (
+                <button
+                  onClick={toggleTorch}
+                  className={`p-2 rounded-full transition ${
+                    torchOn ? 'bg-amber-400 text-slate-900' : 'bg-white/15 text-white'
+                  }`}
+                  title={t.flashLabel}
+                >
+                  {torchOn ? <Zap className="w-5 h-5" /> : <ZapOff className="w-5 h-5" />}
+                </button>
+              )}
+              <button onClick={stopCamera} className="p-2 bg-white/15 rounded-full">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
 
+          {/* Bảng thông báo lỗi / cảnh báo nổi ngay trên màn hình Camera (tự ẩn sau ít giây) */}
+          {cameraBanner && (
+            <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[65] w-[92vw] max-w-md px-4 py-3 rounded-2xl shadow-2xl border-2 text-xs font-bold flex items-center gap-2.5 backdrop-blur-md bg-opacity-95 transition-all"
+              style={{
+                backgroundColor:
+                  cameraBanner.type === 'error'
+                    ? 'rgba(220, 38, 38, 0.94)'
+                    : cameraBanner.type === 'warning'
+                      ? 'rgba(217, 119, 6, 0.94)'
+                      : 'rgba(22, 163, 74, 0.94)',
+                borderColor:
+                  cameraBanner.type === 'error'
+                    ? '#fca5a5'
+                    : cameraBanner.type === 'warning'
+                      ? '#fde68a'
+                      : '#86efac',
+                color: '#ffffff',
+              }}
+            >
+              <AlertTriangle className="w-5 h-5 shrink-0" />
+              <span className="leading-snug">{cameraBanner.text}</span>
+            </div>
+          )}
+
+          {/* Khung hình Camera + 4 Ô VUÔNG ĐỊNH VỊ 4 CHẤM ĐEN */}
           <div className="relative flex-1 overflow-hidden flex items-center justify-center">
             <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
-              <div className="w-full max-w-[340px] aspect-[210/297] border-2 border-dashed border-emerald-400/90 rounded-lg relative">
-                <div className="w-6 h-6 border-t-4 border-l-4 border-emerald-400 absolute -top-1 -left-1" />
-                <div className="w-6 h-6 border-t-4 border-r-4 border-emerald-400 absolute -top-1 -right-1" />
-                <div className="w-6 h-6 border-b-4 border-l-4 border-emerald-400 absolute -bottom-1 -left-1" />
-                <div className="w-6 h-6 border-b-4 border-r-4 border-emerald-400 absolute -bottom-1 -right-1" />
+
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-5">
+              <div
+                ref={guideBoxRef}
+                className={`w-full max-w-[360px] max-h-[76vh] aspect-[196/283] border-2 border-dashed rounded-md relative transition-colors duration-150 ${
+                  liveCorners.foundCount === 4 ? 'border-emerald-400' : 'border-white/50'
+                }`}
+              >
+                {/* 4 ô vuông mục tiêu ở 4 góc — đổi màu XANH LÁ ngay khi chấm đen lọt vào */}
+                {(
+                  [
+                    { key: 'tl', found: Boolean(liveCorners.tl), pos: '-top-5 -left-5' },
+                    { key: 'tr', found: Boolean(liveCorners.tr), pos: '-top-5 -right-5' },
+                    { key: 'bl', found: Boolean(liveCorners.bl), pos: '-bottom-5 -left-5' },
+                    { key: 'br', found: Boolean(liveCorners.br), pos: '-bottom-5 -right-5' },
+                  ] as const
+                ).map((box) => (
+                  <div
+                    key={box.key}
+                    className={`w-10 h-10 rounded-md border-[3.5px] absolute ${box.pos} flex items-center justify-center transition-all duration-150 ${
+                      box.found
+                        ? 'border-[#00e038] bg-[#00e038]/30 scale-110 shadow-[0_0_14px_rgba(0,224,56,0.9)]'
+                        : 'border-white/95 bg-black/25'
+                    }`}
+                  >
+                    <div
+                      className={`w-2 h-2 rounded-sm ${
+                        box.found ? 'bg-[#00e038]' : 'bg-white/75'
+                      }`}
+                    />
+                  </div>
+                ))}
               </div>
             </div>
           </div>
 
-          <div className="bg-black/85 py-5 flex items-center justify-center gap-6">
-            <button
-              onClick={() => handleCaptureFromCamera(false)}
-              disabled={processing}
-              className="w-16 h-16 rounded-full bg-white border-4 border-blue-500 active:scale-90 transition flex items-center justify-center"
-              title="Chụp và chấm"
-            >
-              {processing ? (
-                <Loader2 className="w-6 h-6 animate-spin text-blue-600" />
-              ) : (
-                <div className="w-12 h-12 rounded-full bg-blue-600" />
-              )}
-            </button>
+          {/* Thanh trạng thái tự động chấm (KHÔNG có nút chụp thủ công) */}
+          <div className="bg-black/85 px-4 py-4 text-center text-white z-10">
+            {processing ? (
+              <div className="inline-flex items-center gap-2 text-xs font-bold text-emerald-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {t.autoGradingNow}
+              </div>
+            ) : cooldownLeftMs > 0 ? (
+              <div className="text-xs font-semibold text-amber-300">
+                {t.cooldownNext} {(cooldownLeftMs / 1000).toFixed(1)}s...
+              </div>
+            ) : (
+              <div className="text-xs font-semibold text-slate-200">{t.align4Corners}</div>
+            )}
           </div>
         </div>
       )}
