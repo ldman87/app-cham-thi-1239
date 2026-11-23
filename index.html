@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#1d4ed8" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Chấm Thi 1239" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <title>Chấm Thi 1239 — Mẫu Phiếu BGD&ĐT 2025</title>
+    <script>
+      (function () {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID !== 'function') {
+          var fallbackUUID = function () {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+              var r = (Math.random() * 16) | 0;
+              var v = c === 'x' ? r : (r & 0x3) | 0x8;
+              return v.toString(16);
+            });
+          };
+          try {
+            crypto.randomUUID = fallbackUUID;
+          } catch (e) {
+            try {
+              Object.defineProperty(crypto, 'randomUUID', { value: fallbackUUID });
+            } catch (e2) {}
+          }
+        }
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
