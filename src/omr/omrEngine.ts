@@ -357,8 +357,33 @@ export function detectFiducials(imageData: ImageData, layout: SheetLayout): Dete
 }
 
 /**
+ * Tự động dò 4 chấm đen định vị ở BẤT KỲ vị trí nào trên toàn khung hình Camera (Full-Frame Auto Tracking).
+ * Người dùng chỉ cần đưa tờ phiếu vào khung hình, 4 ô vuông xanh sẽ tự động bám sát 4 chấm đen trên phiếu!
+ */
+export function detectFullFrameCornersLive(
+  imageData: ImageData,
+  layout: SheetLayout
+): LiveCornerStatus {
+  const { width: w, height: h } = imageData;
+  const gray = toGrayscale(imageData);
+
+  // Chia 4 vùng góc rộng phủ gần hết khung hình để tự động bắt dù phiếu đặt lệch hay hơi nghiêng
+  const rx = Math.floor(w * 0.44);
+  const ry = Math.floor(h * 0.34);
+  // Ước lượng kích thước chấm đen khoảng 1.4% .. 2.8% chiều rộng khung hình
+  const expectedRatio = (layout.fiducialSizeMm / layout.pageWidthMm) * 0.85;
+
+  const tl = findFiducialInRegion(gray, w, 0, 0, rx, ry, { x: w * 0.12, y: h * 0.1 }, expectedRatio);
+  const tr = findFiducialInRegion(gray, w, w - rx, 0, w, ry, { x: w * 0.88, y: h * 0.1 }, expectedRatio);
+  const bl = findFiducialInRegion(gray, w, 0, h - ry, rx, h, { x: w * 0.12, y: h * 0.9 }, expectedRatio);
+  const br = findFiducialInRegion(gray, w, w - rx, h - ry, w, h, { x: w * 0.88, y: h * 0.9 }, expectedRatio);
+
+  const foundCount = (tl ? 1 : 0) + (tr ? 1 : 0) + (br ? 1 : 0) + (bl ? 1 : 0);
+  return { tl, tr, br, bl, foundCount };
+}
+
+/**
  * Kiểm tra thời gian thực 4 chấm đen có nằm lọt trong 4 ô vuông định vị trên màn hình Camera không.
- * Chạy siêu nhanh (~15-30ms trên ảnh nhỏ) để đổi màu xanh từng góc ngay lập tức.
  */
 export function detectLiveCornersInGuide(
   imageData: ImageData,

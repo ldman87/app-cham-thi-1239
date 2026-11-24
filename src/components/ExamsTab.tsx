@@ -86,6 +86,7 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
   const [showExamModal, setShowExamModal] = useState(false);
   const [editingExamId, setEditingExamId] = useState<string | null>(null);
   const [editingKeyExam, setEditingKeyExam] = useState<Exam | null>(null);
+  const [hasUnsavedKeys, setHasUnsavedKeys] = useState(false);
   const [activeCode, setActiveCode] = useState<string>('');
   const [newCodeInput, setNewCodeInput] = useState('');
   const [toast, setToast] = useState<string | null>(null);
@@ -172,7 +173,14 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
   const openAnswerKeyEditor = (exam: Exam) => {
     const codes = Object.keys(exam.answerKeys);
     setEditingKeyExam(structuredClone(exam));
+    setHasUnsavedKeys(false);
     setActiveCode(codes[0] || '0101');
+  };
+
+  const handleCloseAnswerEditor = () => {
+    if (hasUnsavedKeys && !confirm(t.confirmDiscardAnswers)) return;
+    setEditingKeyExam(null);
+    setHasUnsavedKeys(false);
   };
 
   const handleAddCode = () => {
@@ -182,6 +190,7 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
       const updated = structuredClone(editingKeyExam);
       updated.answerKeys[cleaned] = createEmptyAnswerKey(cleaned);
       setEditingKeyExam(updated);
+      setHasUnsavedKeys(true);
     }
     setActiveCode(cleaned);
     setNewCodeInput('');
@@ -189,10 +198,12 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
 
   const handleDeleteCode = (code: string) => {
     if (!editingKeyExam) return;
+    if (!confirm(`${t.confirmDeleteCode}\n(${t.codeLabel}: ${code})`)) return;
     const updated = structuredClone(editingKeyExam);
     delete updated.answerKeys[code];
     const remaining = Object.keys(updated.answerKeys);
     setEditingKeyExam(updated);
+    setHasUnsavedKeys(true);
     setActiveCode(remaining[0] || '');
   };
 
@@ -202,6 +213,7 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
     const key = updated.answerKeys[activeCode];
     key.part1[qIdx] = key.part1[qIdx] === val ? '' : val;
     setEditingKeyExam(updated);
+    setHasUnsavedKeys(true);
   };
 
   const updatePart2 = (qIdx: number, subKey: 'a' | 'b' | 'c' | 'd', val: Part2Choice) => {
@@ -210,6 +222,7 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
     const key = updated.answerKeys[activeCode];
     key.part2[qIdx][subKey] = key.part2[qIdx][subKey] === val ? '' : val;
     setEditingKeyExam(updated);
+    setHasUnsavedKeys(true);
   };
 
   const updatePart3 = (qIdx: number, val: string) => {
@@ -217,12 +230,14 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
     const updated = structuredClone(editingKeyExam);
     updated.answerKeys[activeCode].part3[qIdx] = val.replace('.', ',').slice(0, 4);
     setEditingKeyExam(updated);
+    setHasUnsavedKeys(true);
   };
 
   const handleSaveKeys = async () => {
     if (!editingKeyExam) return;
     const regradedCount = await onSaveExam(editingKeyExam, true);
     setEditingKeyExam(null);
+    setHasUnsavedKeys(false);
     showToast(
       regradedCount > 0
         ? `${t.saveAndRegradeBtn} (${regradedCount} ${t.papersUnit})`
@@ -235,13 +250,17 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
     if (!file || !editingKeyExam) return;
     try {
       const imported = await importAnswerKeysFromExcel(file);
-      const count = Object.keys(imported).length;
-      if (count === 0) return;
+      const codes = Object.keys(imported);
+      if (codes.length === 0) {
+        showToast('File Excel không có dữ liệu mã đề hợp lệ.');
+        return;
+      }
       const updated = structuredClone(editingKeyExam);
       updated.answerKeys = { ...updated.answerKeys, ...imported };
       setEditingKeyExam(updated);
-      setActiveCode(Object.keys(imported)[0]);
-      showToast(`${t.importExcel}: ${count} ${t.examCodes}`);
+      setHasUnsavedKeys(true);
+      setActiveCode(codes[0]);
+      showToast(`${t.importedCodesMsg}: ${codes.length} ${t.examCodes} (${codes.join(', ')})`);
     } finally {
       e.target.value = '';
     }
@@ -711,7 +730,7 @@ export const ExamsTab: React.FC<ExamsTabProps> = ({
                 {t.saveAndRegradeBtn}
               </button>
               <button
-                onClick={() => setEditingKeyExam(null)}
+                onClick={handleCloseAnswerEditor}
                 className="p-2 text-slate-500 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl"
               >
                 <X className="w-5 h-5" />

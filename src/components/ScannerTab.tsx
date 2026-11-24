@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Camera,
   CheckCircle2,
   Download,
   Eye,
+  FileDown,
   ImagePlus,
   Loader2,
   Share2,
@@ -30,15 +31,15 @@ import {
 import { TDict } from '../i18n/translations';
 import {
   DetectedCorners,
-  GuideBoxNorm,
   LiveCornerStatus,
-  detectLiveCornersInGuide,
+  detectFullFrameCornersLive,
   gradeBubbleReading,
   isValidCornerQuad,
   scanOMRSheet,
 } from '../omr/omrEngine';
 import { renderSheetToCanvas } from '../omr/sheetRenderer';
 import { getLayoutForExam } from '../omr/sheetTemplate';
+import { exportGradedPapersPdf } from '../omr/pdfGenerator';
 
 interface ScannerTabProps {
   t: TDict;
@@ -95,7 +96,15 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const [exposureSupported, setExposureSupported] = useState(false);
   const [cooldownLeftMs, setCooldownLeftMs] = useState(0);
 
-  // Thẻ nổi hiển thị nhanh kết quả (1s..5s)
+  // Lọc theo lớp & xuất PDF ảnh đã chấm
+  const [paperClassFilter, setPaperClassFilter] = useState<string>('ALL');
+  const [exportingPdf, setExportingPdf] = useState(false);
+
+  // Ảnh kết quả hiển thị ngay trên màn hình Camera (giống Video_cham.mp4)
+  const [cameraPreviewPaper, setCameraPreviewPaper] = useState<GradedPaper | null>(null);
+  const cameraPreviewTimerRef = useRef<number | null>(null);
+
+  // Thẻ nổi hiển thị nhanh kết quả (1s..5s) khi chấm từ thư viện/máy tính
   const [flashPaper, setFlashPaper] = useState<GradedPaper | null>(null);
   const flashTimerRef = useRef<number | null>(null);
   const cameraBannerTimerRef = useRef<number | null>(null);
@@ -111,14 +120,45 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const [editEssay, setEditEssay] = useState('0');
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const guideBoxRef = useRef<HTMLDivElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
   const isCapturingRef = useRef(false);
   const stableLockCountRef = useRef(0);
   const prevCornersRef = useRef<DetectedCorners | null>(null);
   const cooldownUntilRef = useRef(0);
   const partialSightStartRef = useRef<number | null>(null);
+
+  // Danh sách lớp trong các bài đã chấm của kỳ thi hiện tại
+  const paperClasses = useMemo(() => {
+    const map = new Map<string, number>();
+    papers.forEach((p) => {
+      const cls = p.className?.trim() || t.unassignedClass;
+      map.set(cls, (map.get(cls) || 0) + 1);
+    });
+    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [papers, t.unassignedClass]);
+
+  const displayedPapers = useMemo(() => {
+    if (paperClassFilter === 'ALL') return papers;
+    return papers.filter((p) => (p.className?.trim() || t.unassignedClass) === paperClassFilter);
+  }, [papers, paperClassFilter, t.unassignedClass]);
+
+  const handleExportPapersPdf = async () => {
+    if (!exam || displayedPapers.length === 0) return;
+    setExportingPdf(true);
+    try {
+      const count = await exportGradedPapersPdf(exam, displayedPapers, paperClassFilter);
+      if (count === 0) {
+        setStatusMsg(t.noImagePapersForPdf);
+      } else {
+        setStatusMsg(`${t.exportPdfBtn}: ${count} ${t.papersUnit}`);
+      }
+    } finally {
+      setExportingPdf(false);
+    }
+  };
 
   const showCameraBanner = (type: 'error' | 'warning' | 'success', text: string, ms = 3200) => {
     if (cameraBannerTimerRef.current) window.clearTimeout(cameraBannerTimerRef.current);
@@ -173,7 +213,15 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   };
 
   const triggerFlashResult = (paper: GradedPaper, fromCamera = false) => {
-    if (fromCamera && !scanSettings.showResultOnCamera) return;
+    if (fromCamera) {
+      if (!scanSettings.showResultOnCamera) return;
+      if (cameraPreviewTimerRef.current) window.clearTimeout(cameraPreviewTimerRef.current);
+      setCameraPreviewPaper(paper);
+      cameraPreviewTimerRef.current = window.setTimeout(() => {
+        setCameraPreviewPaper(null);
+      }, scanSettings.displaySeconds * 1000);
+      return;
+    }
     if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
     setFlashPaper(paper);
     flashTimerRef.current = window.setTimeout(() => {
@@ -186,6 +234,8 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    if (cameraPreviewTimerRef.current) window.clearTimeout(cameraPreviewTimerRef.current);
+    setCameraPreviewPaper(null);
     setTorchOn(false);
     setTorchSupported(false);
     setCameraOpen(false);
@@ -198,52 +248,102 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
       if (cameraBannerTimerRef.current) window.clearTimeout(cameraBannerTimerRef.current);
+      if (cameraPreviewTimerRef.current) window.clearTimeout(cameraPreviewTimerRef.current);
     };
   }, []);
 
-  /** Quy đổi tọa độ khung ngắm 4 ô vuông trên màn hình sang tọa độ chuẩn hóa [0..1] của khung hình video gốc (có tính object-cover) */
-  const computeGuideBoxOnVideo = (): GuideBoxNorm => {
+  /**
+   * Vẽ trực tiếp 4 ô vuông xanh lá tươi (#00e038) tự động bám sát đúng tọa độ 4 chấm đen
+   * trên khung hình video (giống Video_cham.mp4), có tính chính xác tỷ lệ object-cover.
+   */
+  const drawDynamicCornerBoxes = (
+    status: LiveCornerStatus,
+    probeW: number,
+    probeH: number
+  ) => {
+    const canvas = overlayCanvasRef.current;
     const video = videoRef.current;
-    const guide = guideBoxRef.current;
-    if (!video || !guide || !video.videoWidth || !video.videoHeight) {
-      return { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-    }
+    if (!canvas || !video) return;
+
     const vRect = video.getBoundingClientRect();
-    const gRect = guide.getBoundingClientRect();
+    const cw = Math.round(vRect.width);
+    const ch = Math.round(vRect.height);
+    if (cw <= 0 || ch <= 0) return;
 
-    const vidRatio = video.videoWidth / video.videoHeight;
-    const elRatio = vRect.width / vRect.height;
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw;
+      canvas.height = ch;
+    }
 
-    let renderedW = vRect.width;
-    let renderedH = vRect.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, cw, ch);
+
+    if (status.foundCount === 0) return;
+
+    const vidRatio = probeW / probeH;
+    const elRatio = cw / ch;
+    let renderedW = cw;
+    let renderedH = ch;
     let offsetX = 0;
     let offsetY = 0;
 
     if (vidRatio > elRatio) {
-      // Video rộng hơn phần tử -> bị cắt 2 bên trái/phải
-      renderedH = vRect.height;
-      renderedW = vRect.height * vidRatio;
-      offsetX = (renderedW - vRect.width) / 2;
+      renderedH = ch;
+      renderedW = ch * vidRatio;
+      offsetX = (renderedW - cw) / 2;
     } else {
-      // Video cao hơn phần tử -> bị cắt trên/dưới
-      renderedW = vRect.width;
-      renderedH = vRect.width / vidRatio;
-      offsetY = (renderedH - vRect.height) / 2;
+      renderedW = cw;
+      renderedH = cw / vidRatio;
+      offsetY = (renderedH - ch) / 2;
     }
 
-    const x = Math.max(0, Math.min(1, (gRect.left - vRect.left + offsetX) / renderedW));
-    const y = Math.max(0, Math.min(1, (gRect.top - vRect.top + offsetY) / renderedH));
-    const w = Math.max(0.1, Math.min(1 - x, gRect.width / renderedW));
-    const h = Math.max(0.1, Math.min(1 - y, gRect.height / renderedH));
-    return { x, y, w, h };
+    const toScreen = (pt: { x: number; y: number }) => ({
+      x: (pt.x / probeW) * renderedW - offsetX,
+      y: (pt.y / probeH) * renderedH - offsetY,
+    });
+
+    const boxSize = Math.max(46, Math.min(68, Math.round(cw * 0.15)));
+    const half = boxSize / 2;
+
+    const pts = [status.tl, status.tr, status.br, status.bl];
+    pts.forEach((pt) => {
+      if (!pt) return;
+      const sp = toScreen(pt);
+      ctx.save();
+      ctx.strokeStyle = '#00e038';
+      ctx.lineWidth = 4;
+      ctx.fillStyle = 'rgba(0, 224, 56, 0.14)';
+      ctx.fillRect(sp.x - half, sp.y - half, boxSize, boxSize);
+      ctx.strokeRect(sp.x - half, sp.y - half, boxSize, boxSize);
+      ctx.restore();
+    });
+
+    // Khi bắt đủ 4/4 góc hợp lệ -> nối đường viền xanh mờ quanh tờ phiếu
+    if (status.tl && status.tr && status.br && status.bl) {
+      const sTL = toScreen(status.tl);
+      const sTR = toScreen(status.tr);
+      const sBR = toScreen(status.br);
+      const sBL = toScreen(status.bl);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0, 224, 56, 0.55)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 6]);
+      ctx.beginPath();
+      ctx.moveTo(sTL.x, sTL.y);
+      ctx.lineTo(sTR.x, sTR.y);
+      ctx.lineTo(sBR.x, sBR.y);
+      ctx.lineTo(sBL.x, sBL.y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
   };
 
   /**
-   * Vòng lặp quét thời gian thực (Real-time 4-Corner Strict Auto Lock & Auto Grade):
-   * - Kiểm tra 4 ô vuông mỗi 160ms trên ảnh thu nhỏ (~520px).
-   * - CHỈ chấm khi bắt ĐỦ 4/4 chấm đen + đúng tỷ lệ hình học phiếu A4 + giữ ổn định 3 khung hình liên tiếp.
-   * - Nếu chưa đưa camera vào phiếu (0/4 góc) -> TUYỆT ĐỐI không bật thông báo lỗi.
-   * - Chỉ nhắc nhẹ nếu đang thấy 1–3 chấm đen kéo dài quá 7 giây mà vẫn thiếu góc.
+   * Vòng lặp tự động dò 4 chấm đen toàn khung hình (Full-Frame Auto Tracking giống Video_cham.mp4):
+   * - Không ép người dùng canh 4 ô cố định: camera tự động bắt 4 chấm đen ở bất kỳ đâu trong khung hình.
+   * - 4 ô vuông xanh tự động nhảy theo bám sát 4 chấm đen.
+   * - Giữ ổn định 2 khung hình liên tiếp với tứ giác đúng tỷ lệ phiếu A4 -> tự động chụp & chấm tức thì!
    */
   useEffect(() => {
     if (!cameraOpen || !exam || dupPrompt) return;
@@ -264,19 +364,17 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       const now = Date.now();
       const remain = Math.max(0, cooldownUntilRef.current - now);
       setCooldownLeftMs(remain);
-      if (remain > 0 || isCapturingRef.current) return;
+      if (remain > 0 || isCapturingRef.current || cameraPreviewPaper) return;
 
-      const probeMax = 520;
+      const probeMax = 480;
       const pScale = Math.min(1, probeMax / Math.max(video.videoWidth, video.videoHeight));
       probeCanvas.width = Math.round(video.videoWidth * pScale);
       probeCanvas.height = Math.round(video.videoHeight * pScale);
       probeCtx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height);
 
-      const guideNorm = computeGuideBoxOnVideo();
       const probeData = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height);
-      const status = detectLiveCornersInGuide(probeData, guideNorm, layout);
+      const status = detectFullFrameCornersLive(probeData, layout);
 
-      // Kiểm tra chặt chẽ: đủ 4/4 góc VÀ đúng tỷ lệ hình học phiếu A4
       const candidateQuad: DetectedCorners | null =
         status.foundCount === 4 && status.tl && status.tr && status.br && status.bl
           ? { tl: status.tl, tr: status.tr, br: status.br, bl: status.bl }
@@ -284,24 +382,24 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
 
       const isQuadValid = candidateQuad ? isValidCornerQuad(candidateQuad) : false;
       setLiveCorners(status);
+      drawDynamicCornerBoxes(status, probeCanvas.width, probeCanvas.height);
 
       if (candidateQuad && isQuadValid) {
         partialSightStartRef.current = null;
 
-        // Kiểm tra ổn định tọa độ giữa các khung hình (chống rung tay)
         const prev = prevCornersRef.current;
         const isStable =
           prev &&
-          Math.hypot(candidateQuad.tl.x - prev.tl.x, candidateQuad.tl.y - prev.tl.y) < 14 &&
-          Math.hypot(candidateQuad.tr.x - prev.tr.x, candidateQuad.tr.y - prev.tr.y) < 14 &&
-          Math.hypot(candidateQuad.br.x - prev.br.x, candidateQuad.br.y - prev.br.y) < 14 &&
-          Math.hypot(candidateQuad.bl.x - prev.bl.x, candidateQuad.bl.y - prev.bl.y) < 14;
+          Math.hypot(candidateQuad.tl.x - prev.tl.x, candidateQuad.tl.y - prev.tl.y) < 16 &&
+          Math.hypot(candidateQuad.tr.x - prev.tr.x, candidateQuad.tr.y - prev.tr.y) < 16 &&
+          Math.hypot(candidateQuad.br.x - prev.br.x, candidateQuad.br.y - prev.br.y) < 16 &&
+          Math.hypot(candidateQuad.bl.x - prev.bl.x, candidateQuad.bl.y - prev.bl.y) < 16;
 
         prevCornersRef.current = candidateQuad;
         stableLockCountRef.current = isStable ? stableLockCountRef.current + 1 : 1;
 
-        // Giữ ổn định 3 khung hình liên tiếp (~450ms) -> mới tự động chụp full-res & chấm!
-        if (stableLockCountRef.current >= 3) {
+        // Ổn định 2 khung hình liên tiếp (~300ms) -> tự động chụp full-res & chấm ngay!
+        if (stableLockCountRef.current >= 2) {
           stableLockCountRef.current = 0;
           prevCornersRef.current = null;
           const fullCorners: DetectedCorners = {
@@ -317,10 +415,8 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
         prevCornersRef.current = null;
 
         if (status.foundCount === 0) {
-          // Chưa đưa camera tới phiếu -> KHÔNG đếm lỗi, KHÔNG báo lỗi!
           partialSightStartRef.current = null;
         } else {
-          // Đã thấy 1..3 chấm đen -> bắt đầu đếm nếu giữ quá lâu vẫn thiếu góc
           if (partialSightStartRef.current === null) {
             partialSightStartRef.current = now;
           } else if (now - partialSightStartRef.current >= partialTimeoutMs) {
@@ -329,13 +425,13 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
           }
         }
       }
-    }, 160);
+    }, 150);
 
     return () => {
       window.clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraOpen, exam?.id, dupPrompt, scanSettings.scanSpeedSeconds, t]);
+  }, [cameraOpen, exam?.id, dupPrompt, cameraPreviewPaper, scanSettings.scanSpeedSeconds, t]);
 
   const applyCameraExposure = async (track: MediaStreamTrack, darken: boolean) => {
     try {
@@ -793,25 +889,45 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
             )}
           </div>
 
-          {/* Nút Camera & Chọn ảnh */}
-          <div className="grid grid-cols-2 gap-2.5">
+          {/* 3 nút thao tác: Quét Camera tự động / Chụp ảnh trực tiếp / Chọn từ thư viện */}
+          <div className="grid grid-cols-3 gap-2">
             <button
               onClick={startCamera}
               disabled={processing || !exam}
-              className="flex flex-col items-center justify-center gap-1.5 bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-700 active:scale-95 text-white p-4 rounded-2xl shadow-sm transition"
+              className="flex flex-col items-center justify-center gap-1.5 bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-700 active:scale-95 text-white p-3.5 rounded-2xl shadow-sm transition"
             >
-              <Camera className="w-6 h-6 text-blue-400 dark:text-white" />
-              <span className="text-xs font-bold">{t.btnScanCamera}</span>
+              <Camera className="w-5 h-5 text-emerald-400 dark:text-white" />
+              <span className="text-[11px] font-bold text-center leading-tight">{t.btnScanCamera}</span>
+            </button>
+
+            <button
+              onClick={() => cameraCaptureInputRef.current?.click()}
+              disabled={processing || !exam}
+              className="flex flex-col items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white p-3.5 rounded-2xl shadow-sm transition"
+            >
+              <Camera className="w-5 h-5" />
+              <span className="text-[11px] font-bold text-center leading-tight">{t.btnCapturePhoto}</span>
             </button>
 
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={processing || !exam}
-              className="flex flex-col items-center justify-center gap-1.5 bg-white dark:bg-slate-800 border-2 border-blue-600 hover:bg-blue-50 dark:hover:bg-slate-700 active:scale-95 text-blue-700 dark:text-blue-400 p-4 rounded-2xl shadow-sm transition"
+              className="flex flex-col items-center justify-center gap-1.5 bg-white dark:bg-slate-800 border-2 border-blue-600 hover:bg-blue-50 dark:hover:bg-slate-700 active:scale-95 text-blue-700 dark:text-blue-400 p-3.5 rounded-2xl shadow-sm transition"
             >
-              <ImagePlus className="w-6 h-6" />
-              <span className="text-xs font-bold">{t.btnPickImages}</span>
+              <ImagePlus className="w-5 h-5" />
+              <span className="text-[11px] font-bold text-center leading-tight">{t.btnPickImages}</span>
             </button>
+
+            {/* Input mở thẳng máy ảnh gốc điện thoại để chụp ảnh độ phân giải cao */}
+            <input
+              ref={cameraCaptureInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={handleFileUpload}
+            />
+            {/* Input mở thư viện ảnh chọn 1 hoặc nhiều ảnh */}
             <input
               ref={fileInputRef}
               type="file"
@@ -994,22 +1110,68 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
           )}
         </div>
 
-        {/* CỘT PHẢI: DANH SÁCH BÀI ĐÃ CHẤM */}
+        {/* CỘT PHẢI: DANH SÁCH BÀI ĐÃ CHẤM + LỌC LỚP + XUẤT PDF GỬI LỚP */}
         <div className="lg:col-span-7 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">
-              {t.gradedListTitle} ({papers.length})
-            </h3>
-            <span className="text-[11px] text-slate-500 dark:text-slate-400">{t.clickToInspect}</span>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">
+                {t.gradedListTitle} ({displayedPapers.length})
+              </h3>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">{t.clickToInspect}</span>
+            </div>
+
+            {displayedPapers.length > 0 && (
+              <button
+                onClick={handleExportPapersPdf}
+                disabled={exportingPdf}
+                className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold px-3 py-2 rounded-xl shadow-sm shrink-0 transition"
+              >
+                {exportingPdf ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <FileDown className="w-3.5 h-3.5" />
+                )}
+                {exportingPdf ? t.exportingPdf : t.exportPdfBtn}
+              </button>
+            )}
           </div>
 
-          {papers.length === 0 ? (
+          {/* Thanh lọc nhanh theo Lớp để xuất PDF riêng từng lớp */}
+          {paperClasses.length > 0 && (
+            <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+              <button
+                onClick={() => setPaperClassFilter('ALL')}
+                className={`px-2.5 py-1 rounded-xl text-[11px] font-bold shrink-0 transition ${
+                  paperClassFilter === 'ALL'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                {t.allClasses} ({papers.length})
+              </button>
+              {paperClasses.map(([cls, count]) => (
+                <button
+                  key={cls}
+                  onClick={() => setPaperClassFilter(cls)}
+                  className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold shrink-0 transition ${
+                    paperClassFilter === cls
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  {cls} ({count})
+                </button>
+              ))}
+            </div>
+          )}
+
+          {displayedPapers.length === 0 ? (
             <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-10 text-center text-xs text-slate-500 dark:text-slate-400">
               {t.emptyPapers}
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-2.5">
-              {papers.map((p) => (
+              {displayedPapers.map((p) => (
                 <div
                   key={p.id}
                   onClick={() => openDetailModal(p)}
@@ -1197,46 +1359,35 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
             </div>
           )}
 
-          {/* Khung hình Camera + 4 Ô VUÔNG ĐỊNH VỊ 4 CHẤM ĐEN */}
-          <div className="relative flex-1 overflow-hidden flex items-center justify-center">
+          {/* Khung hình Camera + Canvas vẽ 4 ô vuông xanh TỰ ĐỘNG BÁM 4 CHẤM ĐEN (giống Video_cham.mp4) */}
+          <div className="relative flex-1 overflow-hidden flex items-center justify-center bg-black">
             <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+            <canvas
+              ref={overlayCanvasRef}
+              className="pointer-events-none absolute inset-0 w-full h-full"
+            />
 
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-8">
+            {/* Hiển thị ảnh bài làm đã chấm + nhãn điểm vàng to nổi giữa màn hình giống Video_cham.mp4 */}
+            {cameraPreviewPaper && cameraPreviewPaper.overlayImageDataUrl && (
               <div
-                ref={guideBoxRef}
-                className={`w-full max-w-[340px] max-h-[72vh] aspect-[196/283] border-2 border-dashed rounded-md relative transition-colors duration-150 ${
-                  liveCorners.foundCount === 4 ? 'border-[#00e038]' : 'border-white/50'
-                }`}
+                onClick={() => setCameraPreviewPaper(null)}
+                className="absolute inset-0 z-20 bg-white flex flex-col items-center justify-center p-2 cursor-pointer"
               >
-                {/* 4 ô vuông định vị lớn (64x64px) ở 4 góc — đổi màu XANH LÁ ngay khi chấm đen lọt vào */}
-                {(
-                  [
-                    { key: 'tl', found: Boolean(liveCorners.tl), pos: '-top-8 -left-8' },
-                    { key: 'tr', found: Boolean(liveCorners.tr), pos: '-top-8 -right-8' },
-                    { key: 'bl', found: Boolean(liveCorners.bl), pos: '-bottom-8 -left-8' },
-                    { key: 'br', found: Boolean(liveCorners.br), pos: '-bottom-8 -right-8' },
-                  ] as const
-                ).map((box) => (
-                  <div
-                    key={box.key}
-                    className={`w-16 h-16 rounded-xl border-4 absolute ${box.pos} flex items-center justify-center transition-all duration-150 ${
-                      box.found
-                        ? 'border-[#00e038] bg-[#00e038]/25 scale-105 shadow-[0_0_18px_rgba(0,224,56,0.95)]'
-                        : 'border-white/95 bg-black/25'
-                    }`}
-                  >
-                    <div
-                      className={`w-3 h-3 rounded-sm ${
-                        box.found ? 'bg-[#00e038]' : 'bg-white/75'
-                      }`}
-                    />
+                <img
+                  src={cameraPreviewPaper.overlayImageDataUrl}
+                  alt="Kết quả chấm"
+                  className="max-w-full max-h-full object-contain"
+                />
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="bg-[#ffe600] text-[#dc2626] font-black text-4xl px-8 py-4 rounded-2xl shadow-2xl border-2 border-amber-400">
+                    {cameraPreviewPaper.totalScore.toFixed(2).replace('.', ',')} đ
                   </div>
-                ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
-          {/* Thanh trạng thái tự động chấm (KHÔNG có nút chụp thủ công) */}
+          {/* Thanh trạng thái tự động chấm */}
           <div className="bg-black/85 px-4 py-4 text-center text-white z-10">
             {processing ? (
               <div className="inline-flex items-center gap-2 text-xs font-bold text-emerald-400">
@@ -1248,7 +1399,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
                 {t.cooldownNext} {(cooldownLeftMs / 1000).toFixed(1)}s...
               </div>
             ) : (
-              <div className="text-xs font-semibold text-slate-200">{t.align4Corners}</div>
+              <div className="text-xs font-semibold text-slate-200">{t.flattenSheetHint}</div>
             )}
           </div>
         </div>
