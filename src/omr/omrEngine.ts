@@ -335,30 +335,260 @@ function findFiducialInRegion(
   return bestCenter;
 }
 
+interface SquareCandidate {
+  x: number;
+  y: number;
+  size: number;
+  score: number;
+}
+
 /**
- * Tìm 4 ô vuông đen ở 4 góc phiếu.
- * Giới hạn vùng tìm theo chiều dọc 0..18% và 82..100% để không bắt nhầm 6 ô vuông biên ở giữa phiếu BGD 1239.
+ * Thu thập tất cả ứng viên chấm vuông đen trong một vùng ảnh (có kiểm tra độ đặc, độ vuông
+ * và viền giấy trắng xung quanh để loại bỏ bóng bàn / chữ viết / ô tô nhạt).
+ */
+function collectSquareCandidatesInRegion(
+  gray: Uint8Array,
+  imgW: number,
+  imgH: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  cornerTarget: Point2D,
+  expectedRatio: number,
+  maxCandidates = 8
+): SquareCandidate[] {
+  const rw = x1 - x0;
+  const rh = y1 - y0;
+  if (rw <= 8 || rh <= 8) return [];
+
+  const threshold = computeRegionOtsuThreshold(gray, imgW, x0, y0, x1, y1);
+  const visited = new Uint8Array(rw * rh);
+
+  // Kích thước chấm đen góc (từ 0.9% đến 6.2% chiều rộng ảnh)
+  const minDim = Math.max(5, Math.floor(imgW * 0.009));
+  const maxDim = Math.ceil(imgW * 0.062);
+
+  const candidates: SquareCandidate[] = [];
+  const queueX = new Int32Array(rw * rh);
+  const queueY = new Int32Array(rw * rh);
+
+  for (let ly = 0; ly < rh; ly++) {
+    for (let lx = 0; lx < rw; lx++) {
+      const idx = ly * rw + lx;
+      if (visited[idx]) continue;
+      if (gray[(y0 + ly) * imgW + (x0 + lx)] > threshold) continue;
+
+      let head = 0;
+      let tail = 0;
+      queueX[tail] = lx;
+      queueY[tail] = ly;
+      tail++;
+      visited[idx] = 1;
+
+      let minX = lx, maxX = lx, minY = ly, maxY = ly;
+      let sumX = 0, sumY = 0, count = 0;
+      let innerGraySum = 0;
+
+      while (head < tail) {
+        const cx = queueX[head];
+        const cy = queueY[head];
+        head++;
+        count++;
+        sumX += cx;
+        sumY += cy;
+        innerGraySum += gray[(y0 + cy) * imgW + (x0 + cx)];
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        const neighbors = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1],
+        ];
+        for (let n = 0; n < 4; n++) {
+          const nx = neighbors[n][0];
+          const ny = neighbors[n][1];
+          if (nx < 0 || nx >= rw || ny < 0 || ny >= rh) continue;
+          const nIdx = ny * rw + nx;
+          if (visited[nIdx]) continue;
+          if (gray[(y0 + ny) * imgW + (x0 + nx)] <= threshold) {
+            visited[nIdx] = 1;
+            queueX[tail] = nx;
+            queueY[tail] = ny;
+            tail++;
+          }
+        }
+      }
+
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      if (bw < minDim || bh < minDim || bw > maxDim || bh > maxDim) continue;
+
+      const aspect = bw / bh;
+      if (aspect < 0.65 || aspect > 1.55) continue;
+
+      const fillRatio = count / (bw * bh);
+      if (fillRatio < 0.65) continue;
+
+      const centerX = x0 + sumX / count;
+      const centerY = y0 + sumY / count;
+      const size = (bw + bh) / 2;
+
+      // Kiểm tra tương phản với viền trắng xung quanh chấm đen (loại bỏ vùng tối/bóng bàn)
+      const pad = Math.max(3, Math.round(size * 0.75));
+      const bx0 = Math.max(0, Math.floor(centerX - bw / 2 - pad));
+      const bx1 = Math.min(imgW - 1, Math.ceil(centerX + bw / 2 + pad));
+      const by0 = Math.max(0, Math.floor(centerY - bh / 2 - pad));
+      const by1 = Math.min(imgH - 1, Math.ceil(centerY + bh / 2 + pad));
+
+      let borderSum = 0;
+      let borderCnt = 0;
+      for (let x = bx0; x <= bx1; x += 2) {
+        borderSum += gray[by0 * imgW + x] + gray[by1 * imgW + x];
+        borderCnt += 2;
+      }
+      for (let y = by0; y <= by1; y += 2) {
+        borderSum += gray[y * imgW + bx0] + gray[y * imgW + bx1];
+        borderCnt += 2;
+      }
+      const centerMean = innerGraySum / count;
+      const borderMean = borderCnt > 0 ? borderSum / borderCnt : 200;
+      if (borderMean - centerMean < 38) continue;
+
+      const squareScore = 1 - Math.abs(1 - aspect) * 0.85;
+      const idealSize = imgW * expectedRatio;
+      const sizeScore = 1 / (1 + Math.abs(size - idealSize) / Math.max(4, idealSize));
+      const dist = Math.hypot(centerX - cornerTarget.x, centerY - cornerTarget.y);
+      const distScore = 1 / (1 + dist / (imgW * 0.28));
+      const contrastScore = Math.min(1.5, (borderMean - centerMean) / 110);
+
+      const score = fillRatio * 2.2 + squareScore * 1.5 + sizeScore * 1.1 + distScore * 1.8 + contrastScore;
+      candidates.push({ x: centerX, y: centerY, size, score });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.slice(0, maxCandidates);
+}
+
+/**
+ * Tìm bộ 4 chấm đen NGOÀI CÙNG TẠO THÀNH HÌNH CHỮ NHẬT chuẩn phiếu A4
+ * (cho phép cong vênh / lệch nhẹ nhưng loại bỏ hoàn toàn chấm biên giữa tờ hay ô tròn tô).
+ */
+function findBestOuterRectangle(
+  tlList: SquareCandidate[],
+  trList: SquareCandidate[],
+  brList: SquareCandidate[],
+  blList: SquareCandidate[],
+  imgW: number,
+  imgH: number,
+  idealAspect: number
+): DetectedCorners | null {
+  if (!tlList.length || !trList.length || !brList.length || !blList.length) return null;
+
+  let bestComboScore = -1;
+  let bestQuad: DetectedCorners | null = null;
+  const imgArea = imgW * imgH;
+
+  for (const tl of tlList) {
+    for (const tr of trList) {
+      if (tr.x <= tl.x + imgW * 0.32) continue;
+      for (const bl of blList) {
+        if (bl.y <= tl.y + imgH * 0.42) continue;
+        for (const br of brList) {
+          if (br.x <= bl.x + imgW * 0.32 || br.y <= tr.y + imgH * 0.42) continue;
+
+          // 1. Kích thước 4 chấm đen phải tương đồng nhau
+          const minSz = Math.min(tl.size, tr.size, br.size, bl.size);
+          const maxSz = Math.max(tl.size, tr.size, br.size, bl.size);
+          if (maxSz / Math.max(1, minSz) > 1.65) continue;
+
+          // 2. Kiểm tra hình chữ nhật (cho phép giấy cong vênh / chụp nghiêng nhẹ)
+          const topW = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+          const botW = Math.hypot(br.x - bl.x, br.y - bl.y);
+          const leftH = Math.hypot(bl.x - tl.x, bl.y - tl.y);
+          const rightH = Math.hypot(br.x - tr.x, br.y - tr.y);
+
+          const wDiff = Math.abs(topW - botW) / Math.max(topW, botW);
+          const hDiff = Math.abs(leftH - rightH) / Math.max(leftH, rightH);
+          if (wDiff > 0.16 || hDiff > 0.16) continue;
+
+          // 3. Hai đường chéo hình chữ nhật phải gần bằng nhau (loại bỏ hình bình hành/lệch)
+          const diag1 = Math.hypot(br.x - tl.x, br.y - tl.y);
+          const diag2 = Math.hypot(bl.x - tr.x, bl.y - tr.y);
+          const diagDiff = Math.abs(diag1 - diag2) / Math.max(diag1, diag2);
+          if (diagDiff > 0.14) continue;
+
+          // 4. Tỷ lệ rộng / cao khớp tờ phiếu A4 (~0.693 cho BGD 1239, cho phép cong vênh 0.56 .. 0.84)
+          const avgW = (topW + botW) / 2;
+          const avgH = (leftH + rightH) / 2;
+          const aspect = avgW / avgH;
+          if (aspect < 0.56 || aspect > 0.84) continue;
+
+          // 5. Góc nghiêng cạnh trên và cạnh dưới phải gần song song (< 12 độ)
+          const angleTop = Math.atan2(tr.y - tl.y, tr.x - tl.x);
+          const angleBot = Math.atan2(br.y - bl.y, br.x - bl.x);
+          if (Math.abs(angleTop - angleBot) > (12 * Math.PI) / 180) continue;
+
+          // 6. Xếp hạng: ưu tiên TỐI ĐA bộ 4 chấm NGOÀI CÙNG (diện tích lớn nhất) + độ vuông vức cao nhất
+          const areaRatio = (avgW * avgH) / imgArea;
+          const rectQuality = 1 - (wDiff + hDiff + diagDiff) / 3;
+          const aspectQuality = 1 - Math.min(1, Math.abs(aspect - idealAspect) / 0.25);
+          const sizeConsistency = minSz / maxSz;
+          const avgCandScore = (tl.score + tr.score + br.score + bl.score) / 4;
+
+          const comboScore =
+            areaRatio * 5.0 +
+            rectQuality * 3.0 +
+            aspectQuality * 2.2 +
+            sizeConsistency * 1.4 +
+            avgCandScore * 0.35;
+
+          if (comboScore > bestComboScore) {
+            bestComboScore = comboScore;
+            bestQuad = {
+              tl: { x: tl.x, y: tl.y },
+              tr: { x: tr.x, y: tr.y },
+              br: { x: br.x, y: br.y },
+              bl: { x: bl.x, y: bl.y },
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return bestQuad;
+}
+
+/**
+ * Tìm 4 ô vuông đen ngoài cùng ở 4 góc phiếu (dùng cho cả ảnh chụp/thư viện).
+ * Ghép tổ hợp chọn đúng bộ 4 chấm ngoài cùng tạo thành hình chữ nhật chuẩn A4.
  */
 export function detectFiducials(imageData: ImageData, layout: SheetLayout): DetectedCorners | null {
   const { width: w, height: h } = imageData;
   const gray = toGrayscale(imageData);
 
-  const rx = Math.floor(w * 0.28);
-  const ry = Math.floor(h * 0.18);
+  const rx = Math.floor(w * 0.36);
+  const ry = Math.floor(h * 0.26);
   const expectedRatio = layout.fiducialSizeMm / layout.pageWidthMm;
+  const idealAspect = layout.workWMm / layout.workHMm;
 
-  const tl = findFiducialInRegion(gray, w, 0, 0, rx, ry, { x: w * 0.04, y: h * 0.03 }, expectedRatio);
-  const tr = findFiducialInRegion(gray, w, w - rx, 0, w, ry, { x: w * 0.96, y: h * 0.03 }, expectedRatio);
-  const bl = findFiducialInRegion(gray, w, 0, h - ry, rx, h, { x: w * 0.04, y: h * 0.97 }, expectedRatio);
-  const br = findFiducialInRegion(gray, w, w - rx, h - ry, w, h, { x: w * 0.96, y: h * 0.97 }, expectedRatio);
+  const tlList = collectSquareCandidatesInRegion(gray, w, h, 0, 0, rx, ry, { x: w * 0.04, y: h * 0.03 }, expectedRatio);
+  const trList = collectSquareCandidatesInRegion(gray, w, h, w - rx, 0, w, ry, { x: w * 0.96, y: h * 0.03 }, expectedRatio);
+  const blList = collectSquareCandidatesInRegion(gray, w, h, 0, h - ry, rx, h, { x: w * 0.04, y: h * 0.97 }, expectedRatio);
+  const brList = collectSquareCandidatesInRegion(gray, w, h, w - rx, h - ry, w, h, { x: w * 0.96, y: h * 0.97 }, expectedRatio);
 
-  if (!tl || !tr || !br || !bl) return null;
-  return { tl, tr, br, bl };
+  return findBestOuterRectangle(tlList, trList, brList, blList, w, h, idealAspect);
 }
 
 /**
- * Tự động dò 4 chấm đen định vị ở BẤT KỲ vị trí nào trên toàn khung hình Camera (Full-Frame Auto Tracking).
- * Người dùng chỉ cần đưa tờ phiếu vào khung hình, 4 ô vuông xanh sẽ tự động bám sát 4 chấm đen trên phiếu!
+ * Tự động dò 4 chấm đen NGOÀI CÙNG tạo thành hình chữ nhật trên toàn khung hình Camera (Full-Frame Auto Tracking).
+ * Chỉ trả về 4/4 góc khi 4 chấm đen ngoài cùng tạo thành hình chữ nhật chuẩn phiếu A4 (cho phép cong vênh nhẹ).
  */
 export function detectFullFrameCornersLive(
   imageData: ImageData,
@@ -367,19 +597,31 @@ export function detectFullFrameCornersLive(
   const { width: w, height: h } = imageData;
   const gray = toGrayscale(imageData);
 
-  // Chia 4 vùng góc rộng phủ gần hết khung hình để tự động bắt dù phiếu đặt lệch hay hơi nghiêng
-  const rx = Math.floor(w * 0.44);
-  const ry = Math.floor(h * 0.34);
-  // Ước lượng kích thước chấm đen khoảng 1.4% .. 2.8% chiều rộng khung hình
+  // Vùng tìm kiếm rộng 4 góc khung hình
+  const rx = Math.floor(w * 0.45);
+  const ry = Math.floor(h * 0.35);
   const expectedRatio = (layout.fiducialSizeMm / layout.pageWidthMm) * 0.85;
+  const idealAspect = layout.workWMm / layout.workHMm;
 
-  const tl = findFiducialInRegion(gray, w, 0, 0, rx, ry, { x: w * 0.12, y: h * 0.1 }, expectedRatio);
-  const tr = findFiducialInRegion(gray, w, w - rx, 0, w, ry, { x: w * 0.88, y: h * 0.1 }, expectedRatio);
-  const bl = findFiducialInRegion(gray, w, 0, h - ry, rx, h, { x: w * 0.12, y: h * 0.9 }, expectedRatio);
-  const br = findFiducialInRegion(gray, w, w - rx, h - ry, w, h, { x: w * 0.88, y: h * 0.9 }, expectedRatio);
+  const tlList = collectSquareCandidatesInRegion(gray, w, h, 0, 0, rx, ry, { x: w * 0.08, y: h * 0.06 }, expectedRatio, 7);
+  const trList = collectSquareCandidatesInRegion(gray, w, h, w - rx, 0, w, ry, { x: w * 0.92, y: h * 0.06 }, expectedRatio, 7);
+  const blList = collectSquareCandidatesInRegion(gray, w, h, 0, h - ry, rx, h, { x: w * 0.08, y: h * 0.94 }, expectedRatio, 7);
+  const brList = collectSquareCandidatesInRegion(gray, w, h, w - rx, h - ry, w, h, { x: w * 0.92, y: h * 0.94 }, expectedRatio, 7);
 
-  const foundCount = (tl ? 1 : 0) + (tr ? 1 : 0) + (br ? 1 : 0) + (bl ? 1 : 0);
-  return { tl, tr, br, bl, foundCount };
+  // Ưu tiên tuyệt đối bộ 4 chấm NGOÀI CÙNG tạo thành hình chữ nhật chuẩn A4
+  const rect = findBestOuterRectangle(tlList, trList, brList, blList, w, h, idealAspect);
+  if (rect) {
+    return { tl: rect.tl, tr: rect.tr, br: rect.br, bl: rect.bl, foundCount: 4 };
+  }
+
+  // Nếu chưa đủ hình chữ nhật 4 góc: chỉ hiển thị các chấm ứng viên tốt nhất để người dùng thấy phản hồi trực quan
+  const tl = tlList[0] ? { x: tlList[0].x, y: tlList[0].y } : null;
+  const tr = trList[0] ? { x: trList[0].x, y: trList[0].y } : null;
+  const bl = blList[0] ? { x: blList[0].x, y: blList[0].y } : null;
+  const br = brList[0] ? { x: brList[0].x, y: brList[0].y } : null;
+  const rawCount = (tl ? 1 : 0) + (tr ? 1 : 0) + (br ? 1 : 0) + (bl ? 1 : 0);
+  // Không bao giờ báo 4/4 nếu không vượt qua kiểm tra hình chữ nhật ngoài cùng
+  return { tl, tr, br, bl, foundCount: Math.min(3, rawCount) };
 }
 
 /**

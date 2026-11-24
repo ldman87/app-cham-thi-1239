@@ -304,22 +304,23 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
 
     const boxSize = Math.max(46, Math.min(68, Math.round(cw * 0.15)));
     const half = boxSize / 2;
+    const isLockedRect = status.foundCount === 4 && status.tl && status.tr && status.br && status.bl;
 
     const pts = [status.tl, status.tr, status.br, status.bl];
     pts.forEach((pt) => {
       if (!pt) return;
       const sp = toScreen(pt);
       ctx.save();
-      ctx.strokeStyle = '#00e038';
-      ctx.lineWidth = 4;
-      ctx.fillStyle = 'rgba(0, 224, 56, 0.14)';
+      ctx.strokeStyle = isLockedRect ? '#00e038' : 'rgba(250, 204, 21, 0.7)';
+      ctx.lineWidth = isLockedRect ? 4.5 : 2.5;
+      ctx.fillStyle = isLockedRect ? 'rgba(0, 224, 56, 0.16)' : 'rgba(250, 204, 21, 0.08)';
       ctx.fillRect(sp.x - half, sp.y - half, boxSize, boxSize);
       ctx.strokeRect(sp.x - half, sp.y - half, boxSize, boxSize);
       ctx.restore();
     });
 
-    // Khi bắt đủ 4/4 góc hợp lệ -> nối đường viền xanh mờ quanh tờ phiếu
-    if (status.tl && status.tr && status.br && status.bl) {
+    // Khi bắt đủ 4/4 chấm đen ngoài cùng tạo thành hình chữ nhật -> nối khung viền xanh quanh tờ phiếu
+    if (isLockedRect && status.tl && status.tr && status.br && status.bl) {
       const sTL = toScreen(status.tl);
       const sTR = toScreen(status.tr);
       const sBR = toScreen(status.br);
