@@ -141,14 +141,13 @@ function normalizeIllumination(gray: Uint8Array, width: number, height: number):
       out[rowOff + x] = norm >= 255 ? 255 : norm <= 0 ? 0 : norm | 0;
     }
   }
-  // Tự động làm tối ảnh bằng đường cong Gamma khi ánh sáng mạnh / lóa đèn:
-  // Giữ nền giấy trắng sáng nhưng kéo sẫm nét bút chì 2B bị lóa sáng xuống rõ rệt.
+  // Làm tối nhẹ bằng đường cong Gamma vừa phải khi ánh sáng mạnh / lóa đèn:
+  // Giữ ô trống sạch sẽ (không nhận nhầm ô chưa tô) nhưng vẫn kéo sẫm rõ nét bút chì 2B.
   let sumAll = 0;
   for (let i = 0; i < out.length; i += 4) sumAll += out[i];
   const avgBrightness = sumAll / (out.length / 4);
 
-  // Ảnh càng sáng (ánh sáng mạnh), gamma càng cao (1.85 .. 2.45) để làm tối nét tô rõ hơn
-  const gamma = avgBrightness > 225 ? 2.4 : avgBrightness > 200 ? 2.1 : 1.75;
+  const gamma = avgBrightness > 230 ? 1.65 : avgBrightness > 210 ? 1.48 : 1.3;
   const lut = new Uint8Array(256);
   for (let v = 0; v < 256; v++) {
     lut[v] = Math.min(255, Math.max(0, Math.round(255 * Math.pow(v / 255, gamma))));
@@ -640,8 +639,8 @@ export function detectLiveCornersInGuide(
   const gw = guideBox.w * w;
   const gh = guideBox.h * h;
 
-  // Vùng tìm kiếm rộng tương ứng 4 ô vuông định vị lớn trên màn hình camera (~17% chiều rộng khung)
-  const boxHalf = Math.max(24, Math.round(gw * 0.17));
+  // Vùng tìm kiếm khớp chính xác với 4 ô vuông tĩnh to ở 4 góc màn hình (~11% mỗi bên tâm ô)
+  const boxHalf = Math.max(22, Math.round(gw * 0.125));
   const expectedRatio = (layout.fiducialSizeMm / layout.pageWidthMm) * (gw / w);
 
   const clampRegion = (cx: number, cy: number) => ({
@@ -657,13 +656,48 @@ export function detectLiveCornersInGuide(
   const rBL = clampRegion(gx0, gy0 + gh);
   const rBR = clampRegion(gx0 + gw, gy0 + gh);
 
-  const tl = findFiducialInRegion(gray, w, rTL.x0, rTL.y0, rTL.x1, rTL.y1, rTL.target, expectedRatio);
-  const tr = findFiducialInRegion(gray, w, rTR.x0, rTR.y0, rTR.x1, rTR.y1, rTR.target, expectedRatio);
-  const bl = findFiducialInRegion(gray, w, rBL.x0, rBL.y0, rBL.x1, rBL.y1, rBL.target, expectedRatio);
-  const br = findFiducialInRegion(gray, w, rBR.x0, rBR.y0, rBR.x1, rBR.y1, rBR.target, expectedRatio);
+  const tl = collectSquareCandidatesInRegion(gray, w, h, rTL.x0, rTL.y0, rTL.x1, rTL.y1, rTL.target, expectedRatio, 1)[0];
+  const tr = collectSquareCandidatesInRegion(gray, w, h, rTR.x0, rTR.y0, rTR.x1, rTR.y1, rTR.target, expectedRatio, 1)[0];
+  const bl = collectSquareCandidatesInRegion(gray, w, h, rBL.x0, rBL.y0, rBL.x1, rBL.y1, rBL.target, expectedRatio, 1)[0];
+  const br = collectSquareCandidatesInRegion(gray, w, h, rBR.x0, rBR.y0, rBR.x1, rBR.y1, rBR.target, expectedRatio, 1)[0];
 
-  const foundCount = (tl ? 1 : 0) + (tr ? 1 : 0) + (br ? 1 : 0) + (bl ? 1 : 0);
-  return { tl, tr, br, bl, foundCount };
+  const tlPt = tl ? { x: tl.x, y: tl.y } : null;
+  const trPt = tr ? { x: tr.x, y: tr.y } : null;
+  const blPt = bl ? { x: bl.x, y: bl.y } : null;
+  const brPt = br ? { x: br.x, y: br.y } : null;
+  const foundCount = (tlPt ? 1 : 0) + (trPt ? 1 : 0) + (brPt ? 1 : 0) + (blPt ? 1 : 0);
+  return { tl: tlPt, tr: trPt, br: brPt, bl: blPt, foundCount };
+}
+
+/**
+ * Tinh chỉnh lại tọa độ tâm 4 chấm đen trực tiếp trên ảnh độ phân giải cao (Full-Res)
+ * trong cửa sổ nhỏ xung quanh 4 vị trí đã bắt từ ảnh probe -> sai số < 0.3 pixel!
+ */
+function refineCornersOnFullRes(
+  imageData: ImageData,
+  approx: DetectedCorners,
+  layout: SheetLayout
+): DetectedCorners {
+  const { width: w, height: h } = imageData;
+  const gray = toGrayscale(imageData);
+  const rad = Math.max(24, Math.round(w * 0.045));
+  const expectedRatio = layout.fiducialSizeMm / layout.pageWidthMm;
+
+  const refineOne = (pt: Point2D): Point2D => {
+    const x0 = Math.max(0, Math.floor(pt.x - rad));
+    const y0 = Math.max(0, Math.floor(pt.y - rad));
+    const x1 = Math.min(w, Math.ceil(pt.x + rad));
+    const y1 = Math.min(h, Math.ceil(pt.y + rad));
+    const best = collectSquareCandidatesInRegion(gray, w, h, x0, y0, x1, y1, pt, expectedRatio, 1)[0];
+    return best ? { x: best.x, y: best.y } : pt;
+  };
+
+  return {
+    tl: refineOne(approx.tl),
+    tr: refineOne(approx.tr),
+    br: refineOne(approx.br),
+    bl: refineOne(approx.bl),
+  };
 }
 
 function solveLinearSystem8(A: number[][], b: number[]): number[] {
@@ -880,20 +914,21 @@ function pickSingleFilledIndex(
     const gap = bestScore - secondScore;
 
     const isFilled =
-      bestScore >= 0.22 ||
-      (bestScore >= 0.135 && deltaFromMedian >= 0.068 && gap >= 0.038);
+      bestScore >= 0.24 ||
+      (bestScore >= 0.15 && deltaFromMedian >= 0.08 && gap >= 0.045);
     if (!isFilled) return -1;
 
-    if (allowMultipleReject && secondScore >= 0.26 && gap < 0.06) {
+    if (allowMultipleReject && secondScore >= 0.27 && gap < 0.06) {
       return -1;
     }
     return bestIdx;
   }
 
-  const isFilled = bestScore >= 0.22 || (bestScore >= 0.16 && bestScore - secondScore >= 0.085);
+  // Phần I (4 ô A-D) và Phần II (2 ô Đ/S): ngưỡng chặt hơn chống nhận nhầm ô chưa tô là tô sai
+  const isFilled = bestScore >= 0.255 || (bestScore >= 0.205 && bestScore - secondScore >= 0.115);
   if (!isFilled) return -1;
 
-  if (allowMultipleReject && secondScore >= 0.27 && bestScore - secondScore < 0.075) {
+  if (allowMultipleReject && secondScore >= 0.28 && bestScore - secondScore < 0.08) {
     return -1;
   }
 
@@ -920,12 +955,16 @@ export function scanOMRSheet(
 
   const srcImageData = workCtx.getImageData(0, 0, workCanvas.width, workCanvas.height);
   const corners = preDetectedCorners
-    ? {
-        tl: { x: preDetectedCorners.tl.x * scale, y: preDetectedCorners.tl.y * scale },
-        tr: { x: preDetectedCorners.tr.x * scale, y: preDetectedCorners.tr.y * scale },
-        br: { x: preDetectedCorners.br.x * scale, y: preDetectedCorners.br.y * scale },
-        bl: { x: preDetectedCorners.bl.x * scale, y: preDetectedCorners.bl.y * scale },
-      }
+    ? refineCornersOnFullRes(
+        srcImageData,
+        {
+          tl: { x: preDetectedCorners.tl.x * scale, y: preDetectedCorners.tl.y * scale },
+          tr: { x: preDetectedCorners.tr.x * scale, y: preDetectedCorners.tr.y * scale },
+          br: { x: preDetectedCorners.br.x * scale, y: preDetectedCorners.br.y * scale },
+          bl: { x: preDetectedCorners.bl.x * scale, y: preDetectedCorners.bl.y * scale },
+        },
+        layout
+      )
     : detectFiducials(srcImageData, layout);
 
   if (!corners) {

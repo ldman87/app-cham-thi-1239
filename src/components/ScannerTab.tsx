@@ -31,8 +31,9 @@ import {
 import { TDict } from '../i18n/translations';
 import {
   DetectedCorners,
+  GuideBoxNorm,
   LiveCornerStatus,
-  detectFullFrameCornersLive,
+  detectLiveCornersInGuide,
   gradeBubbleReading,
   isValidCornerQuad,
   scanOMRSheet,
@@ -120,7 +121,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
   const [editEssay, setEditEssay] = useState('0');
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const guideBoxRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraCaptureInputRef = useRef<HTMLInputElement>(null);
@@ -252,99 +253,46 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
     };
   }, []);
 
-  /**
-   * Vẽ trực tiếp 4 ô vuông xanh lá tươi (#00e038) tự động bám sát đúng tọa độ 4 chấm đen
-   * trên khung hình video (giống Video_cham.mp4), có tính chính xác tỷ lệ object-cover.
-   */
-  const drawDynamicCornerBoxes = (
-    status: LiveCornerStatus,
-    probeW: number,
-    probeH: number
-  ) => {
-    const canvas = overlayCanvasRef.current;
+  /** Quy đổi tọa độ khung 4 ô vuông tĩnh trên màn hình sang tọa độ chuẩn hóa [0..1] của video (tính đúng object-cover) */
+  const computeGuideBoxOnVideo = (): GuideBoxNorm => {
     const video = videoRef.current;
-    if (!canvas || !video) return;
-
-    const vRect = video.getBoundingClientRect();
-    const cw = Math.round(vRect.width);
-    const ch = Math.round(vRect.height);
-    if (cw <= 0 || ch <= 0) return;
-
-    if (canvas.width !== cw || canvas.height !== ch) {
-      canvas.width = cw;
-      canvas.height = ch;
+    const guide = guideBoxRef.current;
+    if (!video || !guide || !video.videoWidth || !video.videoHeight) {
+      return { x: 0.08, y: 0.08, w: 0.84, h: 0.84 };
     }
+    const vRect = video.getBoundingClientRect();
+    const gRect = guide.getBoundingClientRect();
 
-    const ctx = canvas.getContext('2d')!;
-    ctx.clearRect(0, 0, cw, ch);
+    const vidRatio = video.videoWidth / video.videoHeight;
+    const elRatio = vRect.width / vRect.height;
 
-    if (status.foundCount === 0) return;
-
-    const vidRatio = probeW / probeH;
-    const elRatio = cw / ch;
-    let renderedW = cw;
-    let renderedH = ch;
+    let renderedW = vRect.width;
+    let renderedH = vRect.height;
     let offsetX = 0;
     let offsetY = 0;
 
     if (vidRatio > elRatio) {
-      renderedH = ch;
-      renderedW = ch * vidRatio;
-      offsetX = (renderedW - cw) / 2;
+      renderedH = vRect.height;
+      renderedW = vRect.height * vidRatio;
+      offsetX = (renderedW - vRect.width) / 2;
     } else {
-      renderedW = cw;
-      renderedH = cw / vidRatio;
-      offsetY = (renderedH - ch) / 2;
+      renderedW = vRect.width;
+      renderedH = vRect.width / vidRatio;
+      offsetY = (renderedH - vRect.height) / 2;
     }
 
-    const toScreen = (pt: { x: number; y: number }) => ({
-      x: (pt.x / probeW) * renderedW - offsetX,
-      y: (pt.y / probeH) * renderedH - offsetY,
-    });
-
-    const boxSize = Math.max(46, Math.min(68, Math.round(cw * 0.15)));
-    const half = boxSize / 2;
-    const isLockedRect = status.foundCount === 4 && status.tl && status.tr && status.br && status.bl;
-
-    const pts = [status.tl, status.tr, status.br, status.bl];
-    pts.forEach((pt) => {
-      if (!pt) return;
-      const sp = toScreen(pt);
-      ctx.save();
-      ctx.strokeStyle = isLockedRect ? '#00e038' : 'rgba(250, 204, 21, 0.7)';
-      ctx.lineWidth = isLockedRect ? 4.5 : 2.5;
-      ctx.fillStyle = isLockedRect ? 'rgba(0, 224, 56, 0.16)' : 'rgba(250, 204, 21, 0.08)';
-      ctx.fillRect(sp.x - half, sp.y - half, boxSize, boxSize);
-      ctx.strokeRect(sp.x - half, sp.y - half, boxSize, boxSize);
-      ctx.restore();
-    });
-
-    // Khi bắt đủ 4/4 chấm đen ngoài cùng tạo thành hình chữ nhật -> nối khung viền xanh quanh tờ phiếu
-    if (isLockedRect && status.tl && status.tr && status.br && status.bl) {
-      const sTL = toScreen(status.tl);
-      const sTR = toScreen(status.tr);
-      const sBR = toScreen(status.br);
-      const sBL = toScreen(status.bl);
-      ctx.save();
-      ctx.strokeStyle = 'rgba(0, 224, 56, 0.55)';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([8, 6]);
-      ctx.beginPath();
-      ctx.moveTo(sTL.x, sTL.y);
-      ctx.lineTo(sTR.x, sTR.y);
-      ctx.lineTo(sBR.x, sBR.y);
-      ctx.lineTo(sBL.x, sBL.y);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.restore();
-    }
+    const x = Math.max(0, Math.min(1, (gRect.left - vRect.left + offsetX) / renderedW));
+    const y = Math.max(0, Math.min(1, (gRect.top - vRect.top + offsetY) / renderedH));
+    const w = Math.max(0.1, Math.min(1 - x, gRect.width / renderedW));
+    const h = Math.max(0.1, Math.min(1 - y, gRect.height / renderedH));
+    return { x, y, w, h };
   };
 
   /**
-   * Vòng lặp tự động dò 4 chấm đen toàn khung hình (Full-Frame Auto Tracking giống Video_cham.mp4):
-   * - Không ép người dùng canh 4 ô cố định: camera tự động bắt 4 chấm đen ở bất kỳ đâu trong khung hình.
-   * - 4 ô vuông xanh tự động nhảy theo bám sát 4 chấm đen.
-   * - Giữ ổn định 2 khung hình liên tiếp với tứ giác đúng tỷ lệ phiếu A4 -> tự động chụp & chấm tức thì!
+   * Vòng lặp tự động dò 4 chấm đen trong 4 Ô VUÔNG TĨNH TO ở 4 góc màn hình (giống Video_cham.mp4):
+   * - Người chấm dễ định vị khoảng cách xa/gần chuẩn nét nhờ 4 ô vuông tĩnh to ở 4 góc.
+   * - Ô vuông nào bắt trúng chấm đen -> sáng viền Xanh lá tươi ngay lập tức.
+   * - Khi 4/4 ô sáng xanh + đúng hình chữ nhật A4 + giữ ổn định 2 khung hình -> chụp full-res & tinh chỉnh tâm 4 góc -> chấm chính xác!
    */
   useEffect(() => {
     if (!cameraOpen || !exam || dupPrompt) return;
@@ -367,14 +315,15 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
       setCooldownLeftMs(remain);
       if (remain > 0 || isCapturingRef.current || cameraPreviewPaper) return;
 
-      const probeMax = 480;
+      const probeMax = 520;
       const pScale = Math.min(1, probeMax / Math.max(video.videoWidth, video.videoHeight));
       probeCanvas.width = Math.round(video.videoWidth * pScale);
       probeCanvas.height = Math.round(video.videoHeight * pScale);
       probeCtx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height);
 
+      const guideNorm = computeGuideBoxOnVideo();
       const probeData = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height);
-      const status = detectFullFrameCornersLive(probeData, layout);
+      const status = detectLiveCornersInGuide(probeData, guideNorm, layout);
 
       const candidateQuad: DetectedCorners | null =
         status.foundCount === 4 && status.tl && status.tr && status.br && status.bl
@@ -383,7 +332,6 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
 
       const isQuadValid = candidateQuad ? isValidCornerQuad(candidateQuad) : false;
       setLiveCorners(status);
-      drawDynamicCornerBoxes(status, probeCanvas.width, probeCanvas.height);
 
       if (candidateQuad && isQuadValid) {
         partialSightStartRef.current = null;
@@ -391,15 +339,14 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
         const prev = prevCornersRef.current;
         const isStable =
           prev &&
-          Math.hypot(candidateQuad.tl.x - prev.tl.x, candidateQuad.tl.y - prev.tl.y) < 16 &&
-          Math.hypot(candidateQuad.tr.x - prev.tr.x, candidateQuad.tr.y - prev.tr.y) < 16 &&
-          Math.hypot(candidateQuad.br.x - prev.br.x, candidateQuad.br.y - prev.br.y) < 16 &&
-          Math.hypot(candidateQuad.bl.x - prev.bl.x, candidateQuad.bl.y - prev.bl.y) < 16;
+          Math.hypot(candidateQuad.tl.x - prev.tl.x, candidateQuad.tl.y - prev.tl.y) < 14 &&
+          Math.hypot(candidateQuad.tr.x - prev.tr.x, candidateQuad.tr.y - prev.tr.y) < 14 &&
+          Math.hypot(candidateQuad.br.x - prev.br.x, candidateQuad.br.y - prev.br.y) < 14 &&
+          Math.hypot(candidateQuad.bl.x - prev.bl.x, candidateQuad.bl.y - prev.bl.y) < 14;
 
         prevCornersRef.current = candidateQuad;
         stableLockCountRef.current = isStable ? stableLockCountRef.current + 1 : 1;
 
-        // Ổn định 2 khung hình liên tiếp (~300ms) -> tự động chụp full-res & chấm ngay!
         if (stableLockCountRef.current >= 2) {
           stableLockCountRef.current = 0;
           prevCornersRef.current = null;
@@ -1360,13 +1307,41 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({
             </div>
           )}
 
-          {/* Khung hình Camera + Canvas vẽ 4 ô vuông xanh TỰ ĐỘNG BÁM 4 CHẤM ĐEN (giống Video_cham.mp4) */}
+          {/* Khung hình Camera + 4 Ô VUÔNG TĨNH TO Ở 4 GÓC (giống Video_cham.mp4) */}
           <div className="relative flex-1 overflow-hidden flex items-center justify-center bg-black">
             <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
-            <canvas
-              ref={overlayCanvasRef}
-              className="pointer-events-none absolute inset-0 w-full h-full"
-            />
+
+            {/* 4 ô vuông tĩnh to ở 4 góc — người chấm dễ canh khoảng cách xa/gần chuẩn nét */}
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-7 py-8">
+              <div
+                ref={guideBoxRef}
+                className="w-full max-w-[360px] max-h-[75vh] aspect-[196/283] relative"
+              >
+                {(
+                  [
+                    { key: 'tl', found: Boolean(liveCorners.tl), pos: '-top-9 -left-9' },
+                    { key: 'tr', found: Boolean(liveCorners.tr), pos: '-top-9 -right-9' },
+                    { key: 'bl', found: Boolean(liveCorners.bl), pos: '-bottom-9 -left-9' },
+                    { key: 'br', found: Boolean(liveCorners.br), pos: '-bottom-9 -right-9' },
+                  ] as const
+                ).map((box) => (
+                  <div
+                    key={box.key}
+                    className={`w-[72px] h-[72px] rounded-lg border-4 absolute ${box.pos} flex items-center justify-center transition-all duration-150 ${
+                      box.found
+                        ? 'border-[#00e038] bg-[#00e038]/20 shadow-[0_0_18px_rgba(0,224,56,0.95)]'
+                        : 'border-white/90 bg-black/15'
+                    }`}
+                  >
+                    <div
+                      className={`w-2.5 h-2.5 rounded-sm ${
+                        box.found ? 'bg-[#00e038]' : 'bg-white/60'
+                      }`}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
 
             {/* Hiển thị ảnh bài làm đã chấm + nhãn điểm vàng to nổi giữa màn hình giống Video_cham.mp4 */}
             {cameraPreviewPaper && cameraPreviewPaper.overlayImageDataUrl && (
